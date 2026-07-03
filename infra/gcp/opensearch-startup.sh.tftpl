@@ -1,0 +1,45 @@
+#!/bin/bash
+# Container-Optimized OS startup script: mount the data disk and run the
+# custom opensearch-multilingual image. Idempotent — safe on reboot.
+set -euxo pipefail
+
+DATA_DEV=/dev/disk/by-id/google-genos-os-data
+MOUNT=/mnt/disks/os
+mkdir -p "$${MOUNT}"
+if ! blkid "$${DATA_DEV}"; then
+  mkfs.ext4 -F "$${DATA_DEV}"
+fi
+mount -o discard,defaults "$${DATA_DEV}" "$${MOUNT}"
+chmod 777 "$${MOUNT}"
+
+# OpenSearch bootstrap requirement (mmap counts).
+sysctl -w vm.max_map_count=262144
+
+# Authenticate Docker to Artifact Registry via the VM service account (COS
+# ships docker-credential-gcr; no key file needed). COS has a READ-ONLY root
+# fs, so /root/.docker isn't writable — point HOME/DOCKER_CONFIG at /home
+# (writable) or configure-docker/pull fail with "read-only file system".
+export HOME=/home/genos
+export DOCKER_CONFIG=/home/genos/.docker
+mkdir -p "$${DOCKER_CONFIG}"
+docker-credential-gcr configure-docker --registries=${region}-docker.pkg.dev
+
+docker rm -f opensearch 2>/dev/null || true
+# Always pull so a re-created VM gets the current image (a cached tag of the
+# wrong arch — e.g. arm64 pushed from an Apple Silicon dev box — won't run here).
+docker pull ${opensearch_image}
+# Env + ulimits mirror docker-compose's opensearch service. memlock ulimit is
+# REQUIRED because bootstrap.memory_lock=true — without it OpenSearch won't boot.
+docker run -d --name opensearch --restart always \
+  -p 9200:9200 \
+  --ulimit memlock=-1:-1 \
+  --ulimit nofile=65536:65536 \
+  -e cluster.name=semantic-search-cluster \
+  -e node.name=opensearch \
+  -e discovery.type=single-node \
+  -e bootstrap.memory_lock=true \
+  -e DISABLE_INSTALL_DEMO_CONFIG=true \
+  -e DISABLE_SECURITY_PLUGIN=true \
+  -e "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g" \
+  -v "$${MOUNT}:/usr/share/opensearch/data" \
+  ${opensearch_image}

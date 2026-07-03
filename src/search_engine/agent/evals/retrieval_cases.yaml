@@ -1,0 +1,751 @@
+# Retrieval-quality eval cases. Run with:
+#
+#   python manage.py agent_eval_setup       # one-time fixture provision
+#   python manage.py agent_eval --retrieval # the suite
+#
+# Each case calls `search(...)` DIRECTLY — no agent loop, no LLM
+# calls — and asserts on the ranked entity list. Free + fast: ideal
+# for CI on every PR.
+#
+# Case schema
+# -----------
+#   id            : required, slug, filter target for --case
+#   query         : required, the search string
+#   fixture: true : auto-fill team_id + user_id from the deterministic
+#                   fixture (see agent/evals/fixture.py). Omit to pin
+#                   your own UUIDs (for legacy / cross-tenant cases).
+#   team_id       : optional, only when `fixture: true` is not set
+#   user_id       : optional, only when `fixture: true` is not set
+#   entity_types  : optional, ["chat","task","note"] — filter the search
+#   date_from     : optional ISO-8601, lower bound on updated_at
+#   date_to       : optional ISO-8601, upper bound on updated_at
+#   limit         : optional, max entities returned (default 10)
+#   use_vector    : optional, default true
+#
+#   expect:
+#     # Hard-pinned ids — use only when ids are stable across reseeds.
+#     must_contain_in_top_n:        { n, entity_ids: [...] }
+#     must_not_contain:             [entity_ids]
+#
+#     # Title substrings (robust across reseeds — preferred).
+#     must_contain_title_in_top_n:  { n, title_substrings: [...] }
+#     must_not_contain_title:       [substrings]
+#     top_result_title_contains:    <substring>
+#
+#     # Entity-type assertions.
+#     must_contain_entity_type_in_top_n: { n, entity_types: [...] }
+#     top_result_entity_type:       <"chat"|"task"|"note"|"project">
+#     result_count_at_least:        N
+#     result_count_at_most:         N
+#
+# Fixture content (re-run `agent_eval_setup --reseed` to refresh):
+#   Projects:   WRD (Website Redesign), QRD (Q2 Roadmap)
+#   Tasks:      WRD-1..9 + QRD-1..9 covering perf budget, design
+#               system v3, framer-motion spike, customer interviews,
+#               Plausible, accessibility, Q3 OKRs, competitor analysis
+#   Notes:      4 personal + 1 task note (interview methodology)
+#               + 1 chat note (Sprint 1 kickoff recap)
+#   Chats:      4 DMs (Bob / Carol / Dan / self) + 1 GM "general"
+#               + 2 PMs (project chats per project)
+#
+# Add a case
+# ----------
+# 1. Pick a query a real user would type.
+# 2. Decide whether retrieval should surface a specific entity (rank
+#    assertion) or a set of entities (recall assertion).
+# 3. Prefer `must_contain_title_in_top_n` over `must_contain_in_top_n`
+#    — fixture ids drift across reseeds but titles are stable.
+# 4. Run `python manage.py agent_eval --retrieval --case <id>` to
+#    iterate.
+
+# ============================================================ #
+# A. Distinctive-content recall (vector lane carries)            #
+# ============================================================ #
+
+- id: perf_budget_finds_relevant_entities
+  fixture: true
+  query: "What's the perf budget for the marketing site?"
+  expect:
+    # Either the spike task or the design-system migration task
+    # (which mentions Lighthouse ≥ 95 + JS ≤ 120KB in the body).
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["framer-motion"]
+
+- id: framer_motion_decision_surfaces_spike
+  fixture: true
+  query: "Why did we rule out framer-motion?"
+  expect:
+    top_result_title_contains: "framer-motion"
+
+- id: customer_interview_synthesis
+  fixture: true
+  query: "Summarize the customer interview signal so far"
+  expect:
+    # Both the synthesis task AND the methodology task-note carry
+    # the "customer interview" theme.
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["customer interview"]
+
+- id: plausible_analytics_task
+  fixture: true
+  query: "How are we measuring traffic on the new pages?"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["Plausible"]
+
+- id: hero_illustration_handoff
+  fixture: true
+  query: "Where's the Figma hero illustration handoff?"
+  expect:
+    # WRD-2 task body mentions Carol's hero illustration handoff
+    # in Figma; WRD-4 ("Build Hero + FeatureGrid") is the task that
+    # USES the handoff. Surfacing either answers the query.
+    must_contain_any_title_in_top_n:
+      n: 5
+      title_substrings: ["design system v3", "Hero + FeatureGrid"]
+
+# ============================================================ #
+# B. Exact-title recall (keyword lane carries)                   #
+# ============================================================ #
+
+- id: title_exact_plausible
+  fixture: true
+  query: "Plausible analytics"
+  expect:
+    top_result_title_contains: "Plausible"
+
+- id: title_exact_responsive_nav
+  fixture: true
+  query: "responsive navigation"
+  expect:
+    top_result_title_contains: "responsive navigation"
+
+- id: title_exact_q3_okrs
+  fixture: true
+  query: "Q3 OKRs"
+  expect:
+    top_result_title_contains: "Q3 OKRs"
+
+- id: title_exact_competitor_analysis
+  fixture: true
+  query: "competitor analysis"
+  expect:
+    top_result_title_contains: "Competitor analysis"
+
+- id: title_exact_sprint_kickoff
+  fixture: true
+  query: "Sprint 1 kickoff"
+  expect:
+    must_contain_title_in_top_n:
+      n: 3
+      title_substrings: ["Sprint 1 kickoff"]
+
+- id: title_exact_v1_launch
+  fixture: true
+  query: "v1.0 Public Launch"
+  expect:
+    top_result_title_contains: "v1.0 Public Launch"
+
+- id: title_exact_design_system_inventory
+  fixture: true
+  query: "design system inventory"
+  expect:
+    must_contain_title_in_top_n:
+      n: 3
+      title_substrings: ["Design system inventory"]
+
+# ============================================================ #
+# C. Paraphrase / question-style recall                          #
+# ============================================================ #
+
+- id: paraphrase_blocked_homepage
+  fixture: true
+  query: "What's blocking the homepage rebuild?"
+  expect:
+    # Multiple plausible "blockers" exist; surfacing any one is a
+    # pass. AND-semantics here was test-author bug — there's no
+    # universe where "responsive navigation" is THE blocker for the
+    # homepage rebuild, but FeatureGrid or the perf task absolutely
+    # are. Use OR matcher.
+    must_contain_any_title_in_top_n:
+      n: 5
+      title_substrings: ["Hero + FeatureGrid", "responsive navigation", "homepage"]
+
+- id: paraphrase_mobile_safari_perf
+  fixture: true
+  query: "Anything about mobile Safari being slow?"
+  expect:
+    top_result_title_contains: "mobile Safari"
+
+- id: paraphrase_accessibility_work
+  fixture: true
+  query: "What are we doing about accessibility?"
+  expect:
+    must_contain_title_in_top_n:
+      n: 3
+      title_substrings: ["Accessibility"]
+
+- id: paraphrase_q3_planning_artifacts
+  fixture: true
+  query: "How are we deciding what to do in Q3?"
+  expect:
+    # Either Q3-planning artifact answers the question; OR semantics.
+    must_contain_any_title_in_top_n:
+      n: 5
+      title_substrings: ["Q3 OKRs", "Roadmap proposal"]
+
+- id: paraphrase_user_research
+  fixture: true
+  query: "Where's the user-research work happening?"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["customer interview"]
+
+# ============================================================ #
+# D. Cross-entity recall (one query → multiple entity types)     #
+# ============================================================ #
+
+- id: cross_entity_synthesis
+  fixture: true
+  query: "synthesis"
+  expect:
+    must_contain_entity_type_in_top_n:
+      n: 5
+      entity_types: ["task", "note"]
+
+- id: cross_entity_design_system
+  fixture: true
+  query: "design system"
+  expect:
+    must_contain_title_in_top_n:
+      n: 10
+      title_substrings: ["design system"]
+
+- id: cross_entity_spotlight_finds_tips_note
+  fixture: true
+  query: "Cmd-K Spotlight tips"
+  expect:
+    must_contain_title_in_top_n:
+      n: 3
+      title_substrings: ["Spotlight"]
+
+# ============================================================ #
+# E. Entity-type filtering (the API param actually works)        #
+# ============================================================ #
+
+- id: filter_tasks_only_for_interview
+  fixture: true
+  query: "customer interview"
+  entity_types: ["task"]
+  expect:
+    top_result_entity_type: "task"
+
+- id: filter_notes_only_for_design_system
+  fixture: true
+  query: "design system"
+  entity_types: ["note"]
+  expect:
+    top_result_entity_type: "note"
+
+- id: filter_chats_only_for_general
+  fixture: true
+  query: "general channel"
+  entity_types: ["chat"]
+  expect:
+    top_result_entity_type: "chat"
+
+# ============================================================ #
+# F. Chat surface recall (matches in chat / thread bodies)       #
+# ============================================================ #
+
+- id: chat_lighthouse_keyword
+  fixture: true
+  query: "Lighthouse mobile score"
+  expect:
+    must_contain_entity_type_in_top_n:
+      n: 10
+      entity_types: ["chat", "task"]
+
+- id: chat_bundle_size_discussion
+  fixture: true
+  query: "JavaScript bundle size budget"
+  expect:
+    must_contain_entity_type_in_top_n:
+      n: 10
+      entity_types: ["chat", "task"]
+
+- id: chat_in_app_animation_decision
+  fixture: true
+  query: "in-app animation framework decision"
+  expect:
+    # Deferred-post-launch decision lives in Bob's DM. The framer-motion
+    # spike task is also relevant context.
+    must_contain_entity_type_in_top_n:
+      n: 5
+      entity_types: ["chat", "task"]
+
+# ============================================================ #
+# G. Project / scope-aware queries                               #
+# ============================================================ #
+
+- id: scope_website_redesign_top
+  fixture: true
+  query: "Website Redesign launch readiness"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["v1.0 Public Launch", "marketing pages"]
+
+- id: scope_q2_roadmap_top
+  fixture: true
+  query: "Q2 discovery sprint progress"
+  expect:
+    # Q2 Discovery Sprint is the milestone task for this project; it
+    # should be the load-bearing top hit. Other QRD tasks are bonus
+    # context, not required.
+    top_result_title_contains: "Q2 Discovery Sprint"
+
+- id: scope_wip_only_returns_something
+  fixture: true
+  query: "what's in progress now"
+  expect:
+    result_count_at_least: 1
+
+# ============================================================ #
+# H. ACL / cross-tenant safety                                   #
+# ============================================================ #
+
+- id: acl_unknown_team_returns_empty
+  # An obviously-non-existent team_id MUST return zero results — no
+  # leaks from other tenants. Bypasses `fixture:` so we hard-code.
+  query: "Plausible analytics"
+  team_id: "00000000-0000-4000-8000-deadbeef0000"
+  user_id: "00000000-0000-4000-8000-deadbeef0001"
+  expect:
+    result_count_at_most: 0
+
+# ============================================================ #
+# I. Robustness / negative                                       #
+# ============================================================ #
+
+- id: gibberish_returns_few_or_nothing
+  fixture: true
+  query: "quantum photosynthesis xylophone marauder"
+  expect:
+    result_count_at_most: 3
+
+- id: single_letter_query_no_crash
+  fixture: true
+  query: "a"
+  expect:
+    # Single-letter shouldn't crash; result count is unconstrained.
+    result_count_at_least: 0
+
+- id: empty_after_strip_no_crash
+  fixture: true
+  query: "   "
+  expect:
+    result_count_at_most: 50  # liberal — just confirm no crash
+
+- id: future_date_filter_returns_empty
+  fixture: true
+  query: "task"
+  date_from: "2099-01-01T00:00:00+00:00"
+  expect:
+    result_count_at_most: 0
+
+- id: limit_is_respected
+  fixture: true
+  query: "task"
+  limit: 3
+  expect:
+    result_count_at_most: 3
+
+- id: vector_only_typo_tolerance
+  fixture: true
+  # Misspelling — vector lane should still surface the framer-motion
+  # entity even though keyword lane misses on the typo.
+  query: "framr-motion vs CSS animations"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["framer-motion"]
+
+# ============================================================ #
+# J. Precision (the WRONG entity must NOT win)                   #
+# ============================================================ #
+
+- id: precision_q3_okrs_not_q2
+  fixture: true
+  query: "Q3 OKRs draft"
+  expect:
+    # The Q2 Discovery Sprint task is also tagged Q2-ish content and
+    # could outrank the actual Q3 task without a tight threshold.
+    top_result_title_contains: "Q3 OKRs"
+
+- id: precision_dovetail_coding
+  fixture: true
+  query: "Dovetail coding"
+  expect:
+    must_contain_title_in_top_n:
+      n: 3
+      title_substrings: ["Dovetail", "Code recordings"]
+
+- id: precision_onboarding_funnel
+  fixture: true
+  query: "Where do users drop off in onboarding?"
+  expect:
+    top_result_title_contains: "Onboarding funnel"
+
+# ============================================================ #
+# K. Stem / synonym / abbreviation recall                       #
+# ============================================================ #
+# User phrasing != indexed phrasing. Direct measurement target
+# for Phase 1.4 (analyzer/synonym expansion at index time). Today
+# these mostly ride the vector lane; with a synonym filter the
+# keyword lane should also resolve them.
+
+- id: synonym_a11y_finds_accessibility
+  fixture: true
+  # Fixture uses both "accessibility" (titles/bodies) and "a11y"
+  # (chats/notes). User typing the abbreviation should still find
+  # the Accessibility task.
+  query: "a11y audit work"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["Accessibility audit"]
+
+- id: synonym_perf_long_form
+  fixture: true
+  # Fixture has both "perf" (chats/comments) and "performance" usage.
+  # Long-form query should surface ANY of the perf-related work
+  # (framer-motion spike, mobile-Safari perf task, design-system
+  # migration which carries perf budget). OR-semantics: any one is
+  # a valid answer.
+  query: "site performance optimisation"
+  expect:
+    must_contain_any_title_in_top_n:
+      n: 5
+      title_substrings: ["framer-motion", "mobile Safari", "design system v3"]
+
+- id: stem_navigation_plural_singular
+  fixture: true
+  # "navigation" (in title) vs "navigations" (plural in the query).
+  # Vector lane handles it semantically; stemmed analyzer would
+  # also resolve on the keyword lane.
+  query: "responsive navigations"
+  expect:
+    top_result_title_contains: "responsive navigation"
+
+# ============================================================ #
+# L. Date-filtered positive                                      #
+# ============================================================ #
+
+- id: date_filter_recent_year_returns_some
+  fixture: true
+  # Fixture is seeded with current-year timestamps. A broad
+  # current-year window with a generic query should still return
+  # at least a few entities — positive smoke test paired with
+  # `future_date_filter_returns_empty`. We intentionally don't
+  # demand many (the threshold + min-score cutoff after date
+  # filtering is conservative; the goal is "filter doesn't kill
+  # everything", not "filter returns 10+").
+  query: "task"
+  date_from: "2026-01-01T00:00:00+00:00"
+  expect:
+    result_count_at_least: 1
+
+# ============================================================ #
+# M. Note-recall (notes were underrepresented — only 1 case)    #
+# ============================================================ #
+
+- id: note_recall_shortcuts_tip
+  fixture: true
+  # Spotlight tips note documents Cmd-K. Query is shortcut-shaped,
+  # the answer is the tips note.
+  query: "keyboard shortcut to open search"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["Spotlight"]
+
+- id: note_recall_weekly_focus
+  fixture: true
+  # "This week's priorities" personal note is the on-topic match.
+  query: "what's the focus this week"
+  expect:
+    top_result_title_contains: "week"
+
+- id: note_recall_design_inventory
+  fixture: true
+  # Design System Inventory note lists primitives ("Stack, Grid, Box"
+  # etc.); query should surface it ahead of design-system tasks.
+  query: "which design system primitives are stable"
+  expect:
+    must_contain_title_in_top_n:
+      n: 3
+      title_substrings: ["Design system inventory"]
+
+# ============================================================ #
+# N. Body-content recall (matches deep in body, not title)       #
+# ============================================================ #
+
+- id: body_recall_button_contrast
+  fixture: true
+  # "secondary-button contrast" appears in the Design System
+  # Inventory body and in a DM. Title contains neither term;
+  # this is a pure body-content recall test.
+  query: "secondary button contrast fix"
+  expect:
+    must_contain_entity_type_in_top_n:
+      n: 5
+      entity_types: ["note", "chat"]
+
+- id: body_recall_featuregrid_blocker
+  fixture: true
+  # Sprint 1 kickoff recap (chat-note) lists "FeatureGrid PR" as a
+  # blocker; the FeatureGrid task is the build target. Either
+  # surfacing satisfies the query.
+  query: "FeatureGrid blocking work"
+  expect:
+    must_contain_any_title_in_top_n:
+      n: 5
+      title_substrings: ["FeatureGrid", "Sprint 1 kickoff"]
+
+# ============================================================ #
+# J (expand). Precision — the WRONG entity must NOT win          #
+# ============================================================ #
+
+- id: precision_design_primitives_not_welcome
+  fixture: true
+  # Welcome note mentions "design" generically. Design System
+  # Inventory is the on-topic note. Welcome should not crowd it out.
+  query: "stable design system primitives"
+  expect:
+    must_not_contain_title:
+      - "Welcome to your demo workspace"
+
+- id: precision_q3_okrs_not_welcome
+  fixture: true
+  # Welcome touches Q3 tangentially; Q3 OKRs task is the load-bearing
+  # match.
+  query: "Q3 OKRs draft tasks"
+  expect:
+    top_result_title_contains: "Q3 OKRs"
+
+# ============================================================ #
+# F (expand). Chat-surface recall                                #
+# ============================================================ #
+
+- id: chat_pricing_component_blocked
+  fixture: true
+  # "Pricing-table component still doesn't have a spec" lives in
+  # Carol's DM; the same blocker is restated in the Sprint 1 recap.
+  query: "pricing component blocked"
+  expect:
+    must_contain_entity_type_in_top_n:
+      n: 5
+      entity_types: ["chat", "note"]
+
+- id: chat_proactive_surfacing_decision
+  fixture: true
+  # "Proactive surfacing vs search" is discussed in Alice's DM thread
+  # and recorded in the Sprint 1 kickoff recap.
+  query: "proactive surfacing vs search decision"
+  expect:
+    must_contain_entity_type_in_top_n:
+      n: 5
+      entity_types: ["chat", "note"]
+
+# ============================================================ #
+# I (expand). Robustness                                          #
+# ============================================================ #
+
+- id: query_with_quotes_no_crash
+  fixture: true
+  # User pasted a quoted phrase. Should not crash the tokenizer
+  # or the OpenSearch query parser.
+  query: "\"customer interview\""
+  expect:
+    result_count_at_least: 0
+
+- id: query_with_special_chars
+  fixture: true
+  # Punctuation + markdown chars in query. Should still resolve
+  # to the framer-motion content.
+  query: "framer-motion vs *CSS* (decision)"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["framer-motion"]
+
+# ============================================================ #
+# J. Precision / noise (Q0.1 — §4.4)                            #
+# ============================================================ #
+# Recall (above) asks "did the gold surface?"; these ask "is the
+# top-k free of noise?" — the opposite pull. They give the
+# continuous `precision_at_k` / `labeled_precision` metric a real
+# population: CLUSTER cases (>=2 relevant titles → the top-k
+# should be packed with the cluster) and DISTRACTOR cases (a known
+# near-neighbour that must NOT crowd in → labeled_precision). The
+# gating assertion stays loose (any-one / a single clear negative)
+# so the pass/fail is stable; the metric carries the real signal.
+
+- id: precision_q2_discovery_cluster
+  fixture: true
+  query: "What discovery work is on the Q2 roadmap?"
+  limit: 8
+  expect:
+    precision_k: 5
+    # Five QRD discovery tasks SHOULD pack the top-5; WRD build
+    # tasks crowding in pulls precision_at_k down.
+    must_contain_any_title_in_top_n:
+      n: 8
+      title_substrings:
+        - "customer interviews"
+        - "themes"
+        - "Discovery Sprint"
+        - "Competitor analysis"
+        - "Onboarding funnel"
+
+- id: precision_design_system_cluster
+  fixture: true
+  query: "Which redesign tasks involve the design system v3 migration?"
+  limit: 8
+  expect:
+    precision_k: 5
+    must_contain_any_title_in_top_n:
+      n: 8
+      title_substrings:
+        - "design system v3"
+        - "Hero + FeatureGrid"
+        - "Migrate marketing pages"
+        - "responsive navigation"
+
+- id: precision_analytics_not_competitor
+  fixture: true
+  # "analytics" shares vocabulary with "Competitor analysis"; the
+  # right hit is the Plausible setup task. If the competitor-analysis
+  # task crowds the top-5, labeled_precision drops.
+  query: "How are we setting up analytics on the new marketing pages?"
+  limit: 8
+  expect:
+    precision_k: 5
+    must_contain_any_title_in_top_n:
+      n: 5
+      title_substrings: ["Plausible"]
+    must_not_contain_title: ["Competitor analysis"]
+
+- id: precision_q3_okrs_focused
+  fixture: true
+  query: "Where is the Q3 OKRs draft?"
+  limit: 8
+  expect:
+    precision_k: 5
+    must_contain_any_title_in_top_n:
+      n: 5
+      title_substrings: ["Q3 OKRs", "top 5 bets for Q3"]
+    must_not_contain_title: ["stakeholder map"]
+
+# ============================================================ #
+# K. Graph-native relational recall (Q2.4 / GraphRAG TARGET)   #
+# ============================================================ #
+# The framer-motion spike BLOCKS the Hero build (seeded TaskDependency),
+# but the Hero task's TEXT need not mention framer-motion — so today's
+# BM25 + vector retrieval cannot connect them. This case asserts the
+# blocked task surfaces for a relational query. It is EXPECTED TO FAIL on
+# the current pipeline (no graph fusion at ranking time) and is the
+# measurable target GraphRAG (A1, §4.3) would turn green — i.e. a red
+# baseline here quantifies the GraphRAG gap. (The reactive get_task_blockers
+# path already covers this relation; see the graph_* behavior cases.)
+
+- id: graph_native_blocked_by_framer_spike
+  fixture: true
+  query: "Which tasks are blocked by the framer-motion spike decision?"
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["Hero + FeatureGrid"]
+
+# ============================================================ #
+# MULTI. Multilingual BM25 (v3 — ICU + kuromoji)               #
+# ============================================================ #
+# These exercise the non-English keyword lane against the dedicated
+# multilingual fixture notes (see agent/evals/fixture.py). Every case
+# pins `use_vector: false` so a PASS proves the BM25/keyword lane — not
+# the already-multilingual vector lane — found the document.
+#
+# REGRESSION-GUARD vs DISCRIMINATOR: the CJK *recall* cases below
+# (ml_ja_keyword / ml_ja_inflection / ml_zh) also pass on a v2 index,
+# because the standard analyzer's per-character unigrams happen to
+# share characters (機械学習 → 機/械/学/習; 走った/走る share 走). They
+# are regression GUARDS — they confirm the multilingual lane keeps
+# returning the right doc, and would catch a future break. The genuine
+# v2→v3 improvement is (a) precision/ranking (v2 unigrams are noisy)
+# and (b) accent folding: `ml_es_accent_folding_cafe` queries the bare
+# "cafe" with no other shared word, so it ONLY passes via icu_folding
+# (café→cafe) and fails on v2. The `_analyze` proofs (unigram→word,
+# 走った→走る base-form, café→cafe) are the definitive evidence.
+
+- id: ml_ja_keyword_kikai_gakushu
+  fixture: true
+  # 機械学習 ("machine learning") has no spaces; icu_tokenizer /
+  # kuromoji segment it into a real term. The JA fixture note's title
+  # carries it verbatim.
+  query: "機械学習"
+  use_vector: false
+  expect:
+    top_result_title_contains: "機械学習"
+
+- id: ml_ja_inflection_hashiru
+  fixture: true
+  # The JA note body says 走った (past tense); the query is the
+  # dictionary form 走る. kuromoji_baseform collapses both to 走る so
+  # the kuromoji `.ja` lane recalls the note.
+  query: "走る"
+  use_vector: false
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["東京マラソン"]
+
+- id: ml_zh_keyword_nlp
+  fixture: true
+  # Chinese, no spaces. icu_tokenizer segments 自然语言处理 into words;
+  # the ZH fixture note carries it in title + body.
+  query: "自然语言处理"
+  use_vector: false
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["自然语言处理"]
+
+- id: ml_es_accent_folding_cafe
+  fixture: true
+  # The ES note title contains the accented "café"; the query is the
+  # bare "cafe" (no other shared word). Only the icu_folding `.icu`
+  # field folds the accent, so a PASS proves folding works — the base
+  # standard field lowercases but does NOT strip the accent, so café
+  # would not match cafe without ICU.
+  query: "cafe"
+  use_vector: false
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["café"]
+
+- id: ml_ar_keyword_cafe
+  fixture: true
+  # Arabic is space-delimited but benefits from ICU normalisation.
+  # المقهى ("the café") appears in the AR fixture note title.
+  query: "المقهى"
+  use_vector: false
+  expect:
+    must_contain_title_in_top_n:
+      n: 5
+      title_substrings: ["المقهى"]

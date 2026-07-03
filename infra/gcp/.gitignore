@@ -1,0 +1,10 @@
+# Local state contains generated secrets (DB password, JWT, etc.) — never commit.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+# NB: .terraform.lock.hcl IS committed (pins provider versions) — not ignored.
+
+# Real variable values (keep only the .example).
+terraform.tfvars
+*.auto.tfvars

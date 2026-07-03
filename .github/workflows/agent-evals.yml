@@ -1,0 +1,191 @@
+# Evals-in-CI quality gate for the Spotlight / Genos AI agent.
+#
+# The "まわす / continuously improve the AI" half of DevOps × AI Agent: every
+# PR runs the agent eval harness against a deterministic seeded fixture, and
+# a merge to `main` only deploys to Cloud Run if the quality gate passes.
+#
+#   * HARD gate  = the RETRIEVAL suite (deterministic, no LLM). Regression if
+#     fewer cases pass than the committed baseline, or mrr/recall drop below
+#     their floors. This is what blocks a deploy.
+#   * REPORT-ONLY = the BEHAVIOR suite + LLM judge (real Gemini via Vertex).
+#     The agent's tool choices + judge scores vary run-to-run, so per-case
+#     behavior is trended/surfaced, never a hard blocker (would flap red).
+#
+# Auth is keyless via Workload Identity Federation; the SA it impersonates has
+# roles/aiplatform.user, so CI calls the SAME Vertex (embeddings + Gemini) as
+# prod — no API keys stored.
+#
+# Required GitHub secrets (from `terraform output` in genos-platform/infra/gcp):
+#   GCP_WIF_PROVIDER  = wif_provider
+#   GCP_DEPLOY_SA     = deploy_service_account
+
+name: agent-evals
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write # mint the WIF OIDC token
+
+concurrency:
+  group: agent-evals-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GCP_PROJECT: amplified-album-496413-t2
+  GCP_REGION: asia-northeast1
+  AR: asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/genos
+  # Retrieval-suite regression floors. The gate runs with the LLM reranker OFF
+  # (RAG_USE_RERANKER=false below) so it's DETERMINISTIC + FAST — no per-query
+  # Gemini call. Numbers sit below the reranked prod run (which adds ~+0.12
+  # recall). Conservative floors catch a real regression (e.g. a dead vector
+  # lane → mrr 0) without flapping; tighten once the no-reranker baseline is
+  # confirmed by a green run.
+  EVAL_MIN_PASS: "45"
+  EVAL_MIN_MRR: "0.65"
+  EVAL_MIN_RECALL: "0.65"
+
+jobs:
+  agent-evals:
+    name: agent-evals (quality gate)
+    runs-on: ubuntu-latest
+    env:
+      PIPENV_VENV_IN_PROJECT: "1"
+      DJANGO_DEBUG: "true"
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/origin
+      DJANGO_SECRET_KEY: ci-eval-secret-key
+      JWT_SECRET_KEY: ci-eval-secret-key
+      OPENSEARCH_HOST: localhost
+      OPENSEARCH_PORT: "9200"
+      # CI uses the same Vertex path as prod (embeddings + Gemini) via WIF ADC.
+      LLM_PROVIDER: gemini
+      GEMINI_USE_VERTEX: "true"
+      GEMINI_PROJECT: amplified-album-496413-t2
+      GEMINI_LOCATION: asia-northeast1
+      EMBEDDING_PROVIDER: vertex
+      # Reranker OFF for the gate: it adds a Gemini call per query
+      # (non-deterministic, slow, Vertex-quota-bound). The gate tests the
+      # deterministic retrieval core (BM25 + vector + RRF).
+      RAG_USE_RERANKER: "false"
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: origin
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (keyless WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Start multilingual OpenSearch (prod image)
+        run: |
+          gcloud auth configure-docker "$GCP_REGION-docker.pkg.dev" --quiet
+          docker run -d --name opensearch -p 9200:9200 \
+            --ulimit memlock=-1:-1 --ulimit nofile=65536:65536 \
+            -e discovery.type=single-node -e bootstrap.memory_lock=true \
+            -e DISABLE_INSTALL_DEMO_CONFIG=true -e DISABLE_SECURITY_PLUGIN=true \
+            -e OPENSEARCH_JAVA_OPTS="-Xms1g -Xmx1g" \
+            "$AR/opensearch-multilingual:3.6.0"
+          echo "waiting for OpenSearch to be green..."
+          for i in $(seq 1 40); do
+            curl -sf localhost:9200/_cluster/health >/dev/null && { echo "up"; break; }
+            sleep 5
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install --upgrade pip pipenv
+      - name: Install deps
+        run: |
+          pipenv sync
+          pipenv run pip install -r requirements-dev.txt
+
+      - name: Migrate + set up OpenSearch index + seed fixture (Vertex reindex)
+        run: |
+          pipenv run python manage.py migrate --noinput
+          # MUST run before any write: creates knowledge_chunks_* with the
+          # knn_vector mapping. Skipping it lets the first reindex auto-create
+          # the index with a default mapping, so `embedding` isn't a knn_vector
+          # and every vector search 400s (silent keyword-only fallback → mrr=0).
+          pipenv run python manage.py opensearch_setup
+          pipenv run python manage.py agent_eval_setup --reseed
+
+      # --- HARD GATE: deterministic retrieval suite ---
+      - name: Retrieval evals — deterministic quality gate
+        run: |
+          set -o pipefail
+          # The suite exits 1 on the documented-red cases, so capture instead of
+          # letting it hard-fail; the gate below decides on baseline + floors.
+          pipenv run python manage.py agent_eval --retrieval | tee eval.out || true
+          python - <<'PY'
+          import os, re, sys
+          out = open("eval.out").read()
+          passed = int(re.search(r"(\d+)/\d+ passed", out).group(1))
+          # Parse the AGGREGATE line ("Continuous metrics: ... mrr=0.870 ..."),
+          # not the per-case "metrics: mrr=1.000" lines that precede it.
+          agg = re.search(r"Continuous metrics:(.*)", out)
+          agg_line = agg.group(1) if agg else ""
+          def metric(name, default=0.0):
+              m = re.search(rf"{name}=([0-9.]+)", agg_line)
+              return float(m.group(1)) if m else default
+          mrr, recall = metric("mrr"), metric("recall_at_n")
+          min_pass = int(os.environ["EVAL_MIN_PASS"])
+          min_mrr = float(os.environ["EVAL_MIN_MRR"])
+          min_recall = float(os.environ["EVAL_MIN_RECALL"])
+          ok = passed >= min_pass and mrr >= min_mrr and recall >= min_recall
+          print(f"\nGATE  passed={passed} (>= {min_pass})  mrr={mrr:.3f} (>= {min_mrr})  "
+                f"recall_at_n={recall:.3f} (>= {min_recall})  ->  {'PASS' if ok else 'FAIL — regression'}")
+          sys.exit(0 if ok else 1)
+          PY
+
+      # --- REPORT-ONLY: behavior smoke + LLM judge (non-deterministic) ---
+      - name: Behavior + judge smoke — report-only (non-blocking)
+        continue-on-error: true
+        # One representative case proves the full agent loop (Gemini generation
+        # + tool use + judge) works, without hammering Vertex with the whole
+        # suite on every PR. Trend the full behavior suite on a schedule instead.
+        run: pipenv run python manage.py agent_eval --case simple_rag_wip_tasks --judge
+
+  deploy:
+    name: deploy to Cloud Run (gated on evals)
+    needs: agent-evals
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to Google Cloud (keyless WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Build + push api image (amd64 — Cloud Run requires it)
+        run: |
+          gcloud auth configure-docker "$GCP_REGION-docker.pkg.dev" --quiet
+          docker build --platform linux/amd64 \
+            -t "$AR/api:${GITHUB_SHA}" -t "$AR/api:latest" .
+          docker push "$AR/api:${GITHUB_SHA}"
+          docker push "$AR/api:latest"
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy genos-api \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --image "$AR/api:${GITHUB_SHA}"

@@ -1,0 +1,29 @@
+# Copy to terraform.tfvars and fill in. Only opensearch_image is strictly
+# required before the first full apply (see README bootstrap).
+
+project_id      = "amplified-album-496413-t2"
+region          = "asia-northeast1"
+zone            = "asia-northeast1-a"
+vertex_location = "asia-northeast1"
+
+# Set after bootstrap step 3 (build + push the custom OpenSearch image):
+opensearch_image = "asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/genos/opensearch-multilingual:3.6.0"
+
+# After you build + push the 4 app images (CI or bootstrap step 5), set these
+# so `terraform apply` points the services at real images. (Image is under
+# ignore_changes, so once set, CI can keep deploying new tags without drift.)
+# images = {
+#   api      = "asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/genos/api:latest"
+#   sockets  = "asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/genos/sockets:latest"
+#   collab   = "asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/genos/collab:latest"
+#   frontend = "asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/genos/frontend:latest"
+# }
+
+# Strongly recommended: custom domains on genosai.dev so the frontend build and
+# inter-service URLs are stable. Leave empty to use the two-phase run.app flow.
+# domains = {
+#   frontend = "genosai.dev"
+#   api      = "api.genosai.dev"
+#   sockets  = "ws.genosai.dev"
+#   collab   = "collab.genosai.dev"
+# }
