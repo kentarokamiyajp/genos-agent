@@ -8,6 +8,8 @@
 **Live:** https://gcp.genosai.dev · **Demo login:** `demo@genosai.dev` / `GenosDemo2026!`
 (a pre-seeded workspace — open `Cmd-K` and ask *"How is the Website Redesign project going?"*)
 
+📐 **システム構成の詳細は [ARCHITECTURE.md](ARCHITECTURE.md)**（インフラ / API / フロントエンド + 図）。
+
 ---
 
 ## つくる → まわす → とどける
