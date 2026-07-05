@@ -6,6 +6,13 @@ region          = "asia-northeast1"
 zone            = "asia-northeast1-a"
 vertex_location = "asia-northeast1"
 
+# Optional: point ONLY the agent LLM at a different Vertex region/endpoint than
+# vertex_location (which also drives embeddings + the reindex job). Use this to
+# reach a Gemini model vertex_location doesn't serve — e.g. a *-preview model on
+# the global endpoint — while embeddings stay on their index's region. Empty
+# falls back to vertex_location.
+# vertex_llm_location = "global"
+
 # Set after bootstrap step 3 (build + push the custom OpenSearch image):
 opensearch_image = "asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/genos/opensearch-multilingual:3.6.0"
 
@@ -27,3 +34,28 @@ opensearch_image = "asia-northeast1-docker.pkg.dev/amplified-album-496413-t2/gen
 #   sockets  = "ws.genosai.dev"
 #   collab   = "collab.genosai.dev"
 # }
+
+# Optional: enable OAuth login (Google / GitHub) in this env. Set a provider's
+# client ID here to wire it into the api service; leave empty to keep it off
+# (initiate returns 503 "…not configured"). BEFORE apply with a non-empty ID,
+# seed the matching secret VERSIONS or the api revision won't start (see README
+# "Optional feature secrets"): genos-<provider>-oauth-secret + genos-oauth-token-key.
+# The provider's callback URL to register is https://<api-domain>/api/v2/oauth/<provider>/callback/.
+# oauth = {
+#   google_client_id = "1234567890-abc.apps.googleusercontent.com"
+#   github_client_id = "Iv1abc123def456"
+# }
+
+# Optional: enable the agent's live web search (Tavily) on the api service.
+# Seed the genos-tavily-api-key secret version BEFORE apply. Free tier is
+# 1000 searches/mo (per-use, no idle cost).
+# tavily_enabled = true
+
+# Optional feature-parity secrets (mirror Railway). Seed the matching secret
+# version(s) BEFORE apply. Values from `railway variables -s backend-django`.
+# email_enabled = true
+# email_from    = "Genos Support <noreply@genosai.dev>"   # a Resend-verified domain
+# claude_enabled = true                                    # CLAUDE_API_KEY → 'claude' model works
+# webpush_enabled = true                                   # browser push (also needs the frontend build arg)
+# webpush_vapid_public_key  = "B...."                      # MUST equal the frontend VITE_VAPID_PUBLIC_KEY
+# webpush_vapid_admin_email = "genos.support@genosai.dev"

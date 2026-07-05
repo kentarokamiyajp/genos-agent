@@ -42,10 +42,13 @@ locals {
   # see README). Optional AI/OAuth keys — the stack boots without them; only
   # the matching feature degrades.
   manual_secrets = [
-    "genos-oauth-token-key",     # Fernet key for encrypted OAuth tokens (Calendar/GitHub tools)
-    "genos-google-oauth-secret", # Google OAuth client secret
-    "genos-github-oauth-secret", # GitHub OAuth client secret
-    "genos-tavily-api-key",      # Tavily (agent web_search tool)
+    "genos-oauth-token-key",           # Fernet key for encrypted OAuth tokens (Calendar/GitHub tools)
+    "genos-google-oauth-secret",       # Google OAuth client secret
+    "genos-github-oauth-secret",       # GitHub OAuth client secret
+    "genos-tavily-api-key",            # Tavily (agent web_search tool)
+    "genos-resend-api-key",            # Resend API key (transactional email: verification / invites / password reset)
+    "genos-claude-api-key",            # Anthropic Claude API key (user-selectable "claude" model)
+    "genos-webpush-vapid-private-key", # Web Push VAPID private key (browser push)
   ]
 }
 

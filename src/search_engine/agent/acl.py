@@ -20,6 +20,7 @@ from django.core.exceptions import ValidationError
 from origin.models.chat.unified_models import Channel, ChannelMember
 from origin.models.note.common_note_models import NotePermissionMaster
 from origin.models.project.prj_models import ProjectMembers
+from origin.models.task.milestone_models import MilestoneAssignees
 from origin.search_engine.chunkers.base import (
     CHAT_TYPE_PM,
     NOTE_TYPE_CHAT,
@@ -79,6 +80,30 @@ def task_acl_user_ids(project_id: int | None, assignee_id, reporter_id) -> set[s
         out.add(str(assignee_id))
     if reporter_id:
         out.add(str(reporter_id))
+    return out
+
+
+def milestone_acl_user_ids(project_id: int | None, milestone_id: int) -> set[str]:
+    """Users allowed to read a milestone — project members + milestone
+    assignees. Mirrors `milestone_chunker`'s `acl_user_ids` derivation so
+    a back-filled citation chip is only surfaced to users search would
+    have surfaced it to."""
+    out: set[str] = set()
+    if project_id:
+        out.update(
+            str(uid)
+            for uid in ProjectMembers.objects.filter(project_id=project_id).values_list(
+                "attendee_id", flat=True
+            )
+            if uid
+        )
+    out.update(
+        str(uid)
+        for uid in MilestoneAssignees.objects.filter(milestone_id=milestone_id).values_list(
+            "user_id", flat=True
+        )
+        if uid
+    )
     return out
 
 

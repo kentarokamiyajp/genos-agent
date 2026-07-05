@@ -58,7 +58,9 @@ DEFAULT_LIMIT = 20
 #                  outrank raw concatenations because the agent reads
 #                  abstracts better than walls of text).
 #   "eval"      → offline `agent_eval --retrieval` harness. Wide pool, flat weights,
-#                  no freshness boost — pure retrieval quality.
+#                  no freshness boost, and no production overlays (reranker /
+#                  graph expansion) unless the caller opts in via `overlays=True`
+#                  — pure retrieval quality by default.
 #
 # Per-mode hyperparameters live in `_MODE_CONFIG` below so a tweak
 # touches one dict, not three call sites.
@@ -173,6 +175,7 @@ def search(
     max_chunks_per_entity: int = 3,
     rewrite: bool = False,
     mode: Optional[SearchMode] = None,
+    overlays: Optional[bool] = None,
 ) -> dict:
     """Run a hybrid search and return entity-grouped results.
 
@@ -216,6 +219,16 @@ def search(
             True → ai_search, False → typeahead. Pinning `pool_size`
             explicitly still wins so callers that know their workload
             can override.
+        overlays: whether the post-ranking production overlays (LLM
+            reranker + graph expansion) may run. `None` resolves per
+            mode: ai_search → True, typeahead/eval → False. This is
+            what keeps `mode="eval"` genuinely raw (BM25 + vector +
+            RRF) now that the overlay flags default ON — the offline
+            harness opts back in per case (`overlays: true` in the
+            case YAML) when it *wants* to measure an overlay. `True`
+            still honors the individual `RAG_USE_RERANKER` /
+            `RAG_GRAPH_EXPANSION` flags, so flag-flip A/Bs via
+            `agent_eval_compare --b-overrides` keep working.
     """
     if not query or not query.strip():
         return {"query": query, "results": []}
@@ -230,6 +243,10 @@ def search(
     ef_search = mode_cfg["ef_search"]
     apply_freshness_flag = mode_cfg["apply_freshness"]
     chunk_type_weights: dict[str, float] = mode_cfg.get("chunk_type_weights") or {}
+    # Overlay resolution (reranker + graph expansion). Only the live
+    # agent path gets them by default; eval stays raw unless the case
+    # opts in, and typeahead never runs them (latency budget).
+    overlays_enabled = overlays if overlays is not None else (mode == "ai_search")
 
     # Settings-level override hooks for the threshold knobs. When the
     # caller didn't explicitly pin a value (i.e. left the kwarg at its
@@ -338,13 +355,20 @@ def search(
     # hits get displaced by semantically-richer-but-less-precise
     # candidates). Locking the top-N from RRF preserves those wins
     # while still letting the reranker fix the noisy tail.
-    # Mode guard: NEVER rerank in typeahead mode. The reranker makes an LLM
-    # call (seconds), which is incompatible with typeahead's sub-100 ms Cmd-K
-    # budget. Reranking/fusion is an ai_search (agent path) + eval (offline
-    # measurement) concern only — so flipping RAG_USE_RERANKER on by default
-    # (Q2.1, backed by measured +0.118 recall on the agent path) doesn't
-    # silently tax the as-you-type surface.
-    if settings.SEARCH_ENGINE.get("RAG_USE_RERANKER") and grouped and mode != "typeahead":
+    # Overlay guard: NEVER rerank in typeahead mode (the reranker makes an
+    # LLM call — seconds — incompatible with the sub-100 ms Cmd-K budget),
+    # and only when `overlays_enabled` (ai_search by default; eval mode is
+    # raw unless the case opts in via `overlays: true`, so the offline
+    # retrieval numbers measure BM25 + vector + RRF, not the production
+    # overlay stack). Flipping RAG_USE_RERANKER on by default (Q2.1, backed
+    # by measured +0.118 recall on the agent path) therefore taxes neither
+    # the as-you-type surface nor the eval baseline.
+    if (
+        settings.SEARCH_ENGINE.get("RAG_USE_RERANKER")
+        and grouped
+        and mode != "typeahead"
+        and overlays_enabled
+    ):
         from origin.search_engine.reranker import rerank  # noqa: PLC0415
 
         input_k = int(settings.SEARCH_ENGINE.get("RAG_RERANK_INPUT_K", 20))
@@ -394,9 +418,15 @@ def search(
     # query ("what's blocked by the framer-motion spike?") surfaces the
     # graph-related task even when it shares no text with the query. Skipped
     # on typeahead (its sub-100 ms budget can't afford the extra DB+OS round
-    # trip); flag-gated. ACL is automatic — neighbors are fetched through the
-    # same acl_user_ids filter as everything else.
-    if settings.SEARCH_ENGINE.get("RAG_GRAPH_EXPANSION") and mode != "typeahead" and grouped:
+    # trip) and when overlays are disabled (eval mode stays raw unless the
+    # case opts in); flag-gated. ACL is automatic — neighbors are fetched
+    # through the same acl_user_ids filter as everything else.
+    if (
+        settings.SEARCH_ENGINE.get("RAG_GRAPH_EXPANSION")
+        and mode != "typeahead"
+        and overlays_enabled
+        and grouped
+    ):
         grouped = _graph_expand(
             grouped,
             team_id=team_id,
@@ -1053,6 +1083,57 @@ def _chunk_for_agent(c: dict) -> dict:
     }
 
 
+def _walk_dependency_graph(
+    fetch_edges,
+    src_score: dict[int, float],
+    *,
+    weight: float,
+    reverse_weight: float,
+    max_hops: int,
+) -> dict[int, tuple[float, str]]:
+    """Bounded frontier walk over the TaskDependency graph (pure — the
+    DB access is injected via `fetch_edges(ids) -> [(blocker, blocked)]`,
+    one call per hop, so the scoring logic unit-tests without a DB).
+
+    Score propagation: a node reached at hop `h` scores
+    `source_score * weight**h`, additionally multiplied by
+    `reverse_weight` for every reverse step (traversing blocked→blocker,
+    i.e. surfacing an UPSTREAM blocker). `reverse_weight=1.0` reproduces
+    the original undirected behavior exactly; < 1.0 makes "what does X
+    block" queries favour downstream neighbours without hiding upstream
+    ones. Best (max) score across paths wins.
+
+    Returns `{task_id: (score, direction)}` for every node reached that
+    is NOT itself a source; `direction` is the last step's traversal
+    ("downstream" = reached via blocker→blocked, "upstream" = reverse)
+    for chip provenance. Nodes already in the result set still propagate
+    (a 2-hop path through an already-retrieved task is legitimate) —
+    the caller filters already-present entities at injection time.
+    """
+    scores: dict[int, float] = dict(src_score)
+    reached: dict[int, tuple[float, str]] = {}
+    frontier: dict[int, float] = dict(src_score)
+    for _hop in range(max(1, max_hops)):
+        if not frontier:
+            break
+        next_frontier: dict[int, float] = {}
+        for blocker, blocked in fetch_edges(list(frontier)):
+            for start, end, direction, mult in (
+                (blocker, blocked, "downstream", weight),
+                (blocked, blocker, "upstream", weight * reverse_weight),
+            ):
+                if start not in frontier or end in src_score:
+                    continue
+                cand = frontier[start] * mult
+                if cand <= 0 or cand <= scores.get(end, 0.0):
+                    continue
+                scores[end] = cand
+                reached[end] = (cand, direction)
+                next_frontier[end] = cand
+        frontier = next_frontier
+    return reached
+
+
 def _graph_expand(
     grouped: list[dict],
     *,
@@ -1062,22 +1143,24 @@ def _graph_expand(
     client,
     index: str,
 ) -> list[dict]:
-    """GraphRAG ranking-fusion (A1 / Q2.4).
+    """GraphRAG ranking-fusion (A1 / Q2.4, multi-hop since A1-ext).
 
-    Walk one hop of the `TaskDependency` graph out from the top retrieved
-    TASK hits and inject the graph-adjacent tasks into the result set with a
-    score decayed from the source hit's score. This surfaces a related task
-    the lexical/vector lanes can't reach (the relation lives in a FK table,
-    not in the text) — e.g. "what's blocked by the framer-motion spike?"
-    surfaces the blocked Hero build even though that task never mentions
-    framer-motion.
+    Walk up to `RAG_GRAPH_MAX_HOPS` hops of the `TaskDependency` graph out
+    from the top retrieved TASK hits and inject the graph-reachable tasks
+    into the result set with a per-hop-decayed score. This surfaces a
+    related task the lexical/vector lanes can't reach (the relation lives
+    in a FK table, not in the text) — e.g. "what's blocked by the
+    framer-motion spike?" surfaces the blocked Hero build even though that
+    task never mentions framer-motion; at 2 hops, "what's downstream of
+    the spike?" also surfaces what the Hero build itself gates.
 
-    Bounded + cheap: at most `RAG_GRAPH_MAX_SOURCES` source tasks → ONE
-    `TaskDependency` query (both directions) → ONE OpenSearch fetch for the
-    neighbours, capped at `RAG_GRAPH_MAX_NEIGHBORS`. ACL is inherited: the
-    neighbour fetch goes through `_build_filter` (team + acl_user_ids), so a
-    task the user can't see is never injected. Neighbours already present in
-    `grouped` are skipped (no dup, no double-count).
+    Bounded + cheap: at most `RAG_GRAPH_MAX_SOURCES` source tasks → one
+    `TaskDependency` query PER HOP over the current frontier → ONE
+    OpenSearch fetch for the injected neighbours, capped at
+    `RAG_GRAPH_MAX_NEIGHBORS` total. ACL is inherited: the neighbour fetch
+    goes through `_build_filter` (team + acl_user_ids), so a task the user
+    can't see is never injected. Neighbours already present in `grouped`
+    are skipped (no dup, no double-count).
     """
     from django.db.models import Q  # noqa: PLC0415
 
@@ -1087,6 +1170,10 @@ def _graph_expand(
     weight = float(se.get("RAG_GRAPH_WEIGHT", 0.6))
     max_sources = int(se.get("RAG_GRAPH_MAX_SOURCES", 5))
     max_neighbors = int(se.get("RAG_GRAPH_MAX_NEIGHBORS", 5))
+    max_hops = max(1, int(se.get("RAG_GRAPH_MAX_HOPS", 1)))
+    reverse_weight = float(se.get("RAG_GRAPH_REVERSE_WEIGHT", 1.0))
+    floor_raw = str(se.get("RAG_GRAPH_VECTOR_FLOOR", "") or "").strip()
+    vector_floor = float(floor_raw) if floor_raw else None
 
     # Source task ids = the top task hits (graph edges are task↔task). Only
     # expand from a LEXICALLY-anchored hit (keyword_rank present): a real
@@ -1094,42 +1181,51 @@ def _graph_expand(
     # noise matches nothing lexically — so this gate stops graph expansion
     # from inflating the result set on a query that should return ~nothing
     # (e.g. the `gibberish_returns_few_or_nothing` case), while still firing
-    # on genuine relational queries.
+    # on genuine relational queries. `RAG_GRAPH_VECTOR_FLOOR` (empty = off)
+    # relaxes the gate for STRONG vector-only hits: a paraphrase relational
+    # query that shares no token with the source task can still seed
+    # expansion when its post-fusion score clears the calibrated floor —
+    # weak vector noise (gibberish sits well below any sane floor) still
+    # can't.
     src_score: dict[int, float] = {}
     present_ids: set = {e.get("entity_id") for e in grouped}
     for e in grouped:
         if e.get("entity_type") != "task" or not e.get("task_id"):
             continue
-        if e.get("keyword_rank") is None:
+        score = float(e.get("score") or 0.0)
+        if e.get("keyword_rank") is None and (vector_floor is None or score < vector_floor):
             continue
         try:
             tid = int(e["task_id"])
         except (TypeError, ValueError):
             continue
-        src_score.setdefault(tid, float(e.get("score") or 0.0))
+        src_score.setdefault(tid, score)
         if len(src_score) >= max_sources:
             break
     if not src_score:
         return grouped
 
-    ids = list(src_score)
-    edges = (
-        TaskDependency.objects.filter(team_id=team_id)
-        .filter(Q(blocker_task_id__in=ids) | Q(blocked_task_id__in=ids))
-        .values_list("blocker_task_id", "blocked_task_id")
-    )
+    def _fetch_edges(ids: list[int]):
+        return TaskDependency.objects.filter(team_id=team_id).filter(
+            Q(blocker_task_id__in=ids) | Q(blocked_task_id__in=ids)
+        ).values_list("blocker_task_id", "blocked_task_id")
 
-    # Neighbour task id → best (max) decayed score across the sources that
-    # reach it. A neighbour already in `grouped` is left alone.
-    neigh_score: dict[int, float] = {}
-    for blocker, blocked in edges:
-        for end, other in ((blocker, blocked), (blocked, blocker)):
-            if end in src_score and other not in src_score and f"task:{other}" not in present_ids:
-                neigh_score[other] = max(neigh_score.get(other, 0.0), src_score[end] * weight)
-    if not neigh_score:
+    walked = _walk_dependency_graph(
+        _fetch_edges,
+        src_score,
+        weight=weight,
+        reverse_weight=reverse_weight,
+        max_hops=max_hops,
+    )
+    # Inject only tasks not already in the result set (mid-path nodes that
+    # were retrieved keep their own retrieval score).
+    reachable = {t: sd for t, sd in walked.items() if f"task:{t}" not in present_ids}
+    if not reachable:
         return grouped
 
-    neigh_ids = sorted(neigh_score, key=lambda t: -neigh_score[t])[:max_neighbors]
+    neigh_ids = sorted(reachable, key=lambda t: -reachable[t][0])[:max_neighbors]
+    neigh_score = {t: reachable[t][0] for t in neigh_ids}
+    neigh_direction = {t: reachable[t][1] for t in neigh_ids}
     entity_ids = [f"task:{t}" for t in neigh_ids]
 
     # ACL-filtered fetch of the neighbour task chunks (same filter as search).
@@ -1176,10 +1272,15 @@ def _graph_expand(
             tid = None
         e["score"] = neigh_score.get(tid, 0.0) if tid is not None else 0.0
         # Mark provenance so the chip-row / agent can tell a graph-pulled
-        # result from a lexical/vector hit.
-        e["matched_terms"] = list(
-            dict.fromkeys((e.get("matched_terms") or []) + ["graph:dependency"])
+        # result from a lexical/vector hit. The plain `graph:dependency`
+        # marker predates the direction split — kept for compatibility;
+        # the `:downstream` / `:upstream` variant says which way the last
+        # hop traversed (downstream = the source blocks this task).
+        direction = neigh_direction.get(tid) if tid is not None else None
+        provenance = ["graph:dependency"] + (
+            [f"graph:dependency:{direction}"] if direction else []
         )
+        e["matched_terms"] = list(dict.fromkeys((e.get("matched_terms") or []) + provenance))
         e["graph_related"] = True
 
     grouped = grouped + neighbours

@@ -1,0 +1,221 @@
+{
+  "version": 1,
+  "generated_at": "2026-07-05T05:22:43+00:00",
+  "cases": {
+    "acl_unauthorized_fetch_pm_chat": [
+      "list_projects",
+      "search_knowledge_base"
+    ],
+    "acl_unauthorized_fetch_task": [
+      "fetch_task"
+    ],
+    "aggregate_project_summary": [
+      "get_project_summary",
+      "list_projects",
+      "list_tasks"
+    ],
+    "aggregate_stale_tasks": [
+      "get_stale_tasks"
+    ],
+    "aggregate_throughput_stats": [
+      "get_task_throughput_stats"
+    ],
+    "aggregate_workload_distribution": [
+      "get_workload_distribution"
+    ],
+    "ambiguous_query": [
+      "get_my_focus_tasks",
+      "get_my_task_summary",
+      "list_my_inbox"
+    ],
+    "bounded_steps_simple_question": [
+      "list_tasks"
+    ],
+    "citation_lists_each_project": [
+      "list_projects"
+    ],
+    "citation_no_fake_on_nonexistent_task": [
+      "fetch_task"
+    ],
+    "complete_cross_project_five_facts": [
+      "search_knowledge_base"
+    ],
+    "complete_four_part_wrd": [
+      "list_projects",
+      "list_tasks",
+      "search_knowledge_base"
+    ],
+    "compound_blocker_and_plan": [
+      "search_knowledge_base"
+    ],
+    "compound_blockers_overview": [
+      "get_task_blockers",
+      "search_knowledge_base"
+    ],
+    "compound_dep_responsive_nav_assignee": [
+      "fetch_task",
+      "get_team_members",
+      "search_knowledge_base"
+    ],
+    "compound_indep_perf_and_wip_count": [
+      "get_team_task_summary",
+      "list_tasks",
+      "search_knowledge_base"
+    ],
+    "compound_mixed_framer_chat_and_task": [
+      "search_knowledge_base"
+    ],
+    "compound_perf_and_owner": [
+      "search_knowledge_base"
+    ],
+    "compound_three_part_facts": [
+      "fetch_task",
+      "get_team_members",
+      "search_knowledge_base"
+    ],
+    "compound_two_project_summaries": [
+      "get_task_blockers",
+      "list_projects",
+      "list_tasks"
+    ],
+    "context_boundary_incident_follow_up_owner": [
+      "search_knowledge_base"
+    ],
+    "context_boundary_incident_root_cause": [
+      "search_knowledge_base"
+    ],
+    "context_boundary_vendor_budget_owner": [
+      "search_knowledge_base"
+    ],
+    "context_boundary_vendor_decision": [
+      "search_knowledge_base"
+    ],
+    "convmem_recall_experiment_name": [
+      "search_past_conversations"
+    ],
+    "convmem_recall_staging_rotation": [
+      "search_past_conversations"
+    ],
+    "fetch_existing_task_v1_launch": [
+      "fetch_task",
+      "search_knowledge_base"
+    ],
+    "fetch_nonexistent_task": [
+      "fetch_task"
+    ],
+    "fetch_personal_note_spotlight_tips": [
+      "fetch_note",
+      "search_knowledge_base"
+    ],
+    "fetch_pm_chat": [
+      "fetch_chat_thread",
+      "list_projects",
+      "search_knowledge_base"
+    ],
+    "graph_blockers_of_hero_build": [
+      "get_task_blockers",
+      "search_knowledge_base"
+    ],
+    "graph_downstream_of_framer_spike": [
+      "get_task_blockers",
+      "search_knowledge_base"
+    ],
+    "injection_ignore_previous_instructions": [
+      "get_project_summary",
+      "get_team_task_summary",
+      "list_tasks"
+    ],
+    "injection_role_override": [
+      "fetch_note",
+      "get_project_activity_ranking",
+      "search_knowledge_base"
+    ],
+    "injection_suffix_attack": [
+      "fetch_note",
+      "search_knowledge_base"
+    ],
+    "list_high_priority_open": [
+      "get_my_focus_tasks"
+    ],
+    "list_overdue_tasks": [
+      "list_tasks"
+    ],
+    "members_of_website_redesign": [
+      "list_project_members",
+      "list_projects"
+    ],
+    "multi_step_citation_required": [
+      "get_task_throughput_stats",
+      "get_team_task_summary",
+      "get_workload_distribution"
+    ],
+    "multi_step_search_then_fetch_existing": [
+      "search_knowledge_base"
+    ],
+    "multi_turn_recall_early_topic": [
+      "list_projects",
+      "list_tasks",
+      "search_past_conversations"
+    ],
+    "multitool_project_health_and_workload": [
+      "get_project_summary",
+      "get_workload_distribution",
+      "list_projects"
+    ],
+    "multitool_team_and_status": [
+      "get_team_members",
+      "get_team_task_summary"
+    ],
+    "multitool_throughput_and_closers": [
+      "get_task_throughput_stats",
+      "get_top_task_closers"
+    ],
+    "negtool_identity_no_search": [
+      "get_current_user"
+    ],
+    "negtool_internal_count_no_web": [
+      "get_team_task_summary"
+    ],
+    "negtool_read_query_no_write": [
+      "list_tasks"
+    ],
+    "no_result_quantum_computing": [
+      "search_knowledge_base"
+    ],
+    "no_result_unrelated_topic": [
+      "search_knowledge_base"
+    ],
+    "prose_cite_decision_from_thread": [
+      "search_knowledge_base"
+    ],
+    "prose_cite_multi_source_summary": [
+      "get_my_blockers",
+      "get_team_members",
+      "get_team_task_summary",
+      "list_tasks"
+    ],
+    "prose_cite_project_status": [
+      "get_project_summary",
+      "list_projects",
+      "search_knowledge_base"
+    ],
+    "simple_rag_notes_exist": [
+      "search_knowledge_base"
+    ],
+    "simple_rag_opensearch_topic": [
+      "search_knowledge_base"
+    ],
+    "simple_rag_wip_tasks": [
+      "list_tasks"
+    ],
+    "team_vs_project_members_disambiguation": [
+      "get_team_members"
+    ],
+    "who_am_i": [
+      "get_current_user"
+    ],
+    "who_is_on_team": [
+      "get_team_members"
+    ]
+  }
+}

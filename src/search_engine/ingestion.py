@@ -29,7 +29,10 @@ from opensearchpy import helpers as os_helpers
 
 from origin.search_engine.chunkers.base import Chunk, EntityChunks
 from origin.search_engine.chunkers.chat_chunker import iter_all_chat_chunks
-from origin.search_engine.chunkers.conversation_chunker import iter_conversation_chunks
+from origin.search_engine.chunkers.conversation_chunker import (
+    conversation_chunks_for_run,
+    iter_conversation_chunks,
+)
 from origin.search_engine.chunkers.milestone_chunker import iter_milestone_chunks
 from origin.search_engine.chunkers.note_chunker import iter_all_note_chunks
 from origin.search_engine.chunkers.note_summary_chunker import iter_note_summary_chunks
@@ -147,6 +150,41 @@ def ingest_all(
 
     log.info("Ingestion done: %s", stats.as_dict())
     return stats
+
+
+def ingest_conversation_run(run) -> bool:
+    """Index ONE completed `AgentRun` into the conversation lane,
+    immediately searchable (C1 near-real-time hook, §4.7).
+
+    Called by `agent_views._stream_ndjson` right after a run is saved
+    with `status="done"` — off the user-visible stream (the last byte
+    has already been sent), so the ~1 embed call + bulk write + refresh
+    it costs never delays an answer. Returns True when a chunk was
+    indexed, False when the run isn't durable memory (wrong status,
+    empty answer, missing scope).
+
+    Idempotent with the 10-minute incremental reindexer that remains
+    the backstop: `_ingest_entity` hash-diffs against `RagChunk`, so
+    when the cron re-sees this run the chunk is `unchanged` and no
+    re-embed happens. The explicit refresh matters because the default
+    deferred-refresh mode (`RAG_BULK_REFRESH=false`) leaves bulk writes
+    invisible to search until *some* refresh runs — without it the
+    "recall what we discussed a minute ago" case would silently wait
+    for the next cron pass.
+    """
+    entity = conversation_chunks_for_run(run)
+    if entity is None:
+        return False
+    stats = IngestionStats()
+    _ingest_entity(entity, stats, dry_run=False)
+    if not settings.SEARCH_ENGINE.get("RAG_BULK_REFRESH", False):
+        try:
+            get_client().indices.refresh(index=get_index_alias())
+        except Exception:  # noqa: BLE001 — refresh failure is non-fatal
+            log.exception(
+                "Post-conversation refresh failed; the chunk becomes searchable on next refresh."
+            )
+    return True
 
 
 def _ingest_stream(

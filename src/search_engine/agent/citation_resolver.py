@@ -21,9 +21,10 @@ a worse-looking answer, not a security leak.
 
 Source-builder injection: this module avoids importing from
 `controller.py` (which would create a circular dependency — controller
-imports this module) by accepting the four `_xxx_source` builders as
+imports this module) by accepting the `_xxx_source` builders as
 function arguments. Callers pass references to `_task_source`,
-`_project_source`, `_chat_source`, `_note_source` from the controller.
+`_project_source`, `_chat_source`, `_note_source`, `_todo_source`, and
+`_milestone_source` from the controller.
 """
 
 from __future__ import annotations
@@ -32,14 +33,17 @@ import logging
 import re
 from typing import Any, Callable
 
+from origin.models.chat.todo_models import ToDoItem
 from origin.models.note.chat_note_models import ChatNoteMaster
 from origin.models.note.personal_note_models import PersonalNoteMaster
 from origin.models.note.task_note_models import TaskNoteMaster
 from origin.models.project.prj_models import ProjectMaster, ProjectMembers
+from origin.models.task.milestone_models import MilestoneMaster
 from origin.models.task.task_models import TaskMaster
 from origin.search_engine.agent.acl import (
     chat_acl_user_ids,
     chat_note_acl_user_ids,
+    milestone_acl_user_ids,
     personal_note_acl_user_ids,
     task_acl_user_ids,
     task_note_acl_user_ids,
@@ -53,10 +57,17 @@ from origin.search_engine.chunkers.base import (
 
 log = logging.getLogger(__name__)
 
-# Same pattern the frontend rewriter uses (citationUtils.ts) —
-# anchored to the four known entity prefixes so an unrelated
-# bracketed phrase ("[reminder: ship Friday]") doesn't trip it.
-_CITATION_RE = re.compile(r"\[((?:chat|task|note|project):[^\]\s]+)\]")
+# Matches BOTH citation forms the agent emits (§4.6 D5): the natural-prose
+# link `[prose](type:id)` (id in group 1) and the bare `[type:id]` fallback
+# (id in group 2). The link alternative is FIRST and consumes the whole
+# `[label](id)`. Anchored to the known entity prefixes so an unrelated
+# bracketed phrase ("[reminder: ship Friday]") doesn't trip it. Keep this
+# prefix set in sync with `CITATION_PATTERN` / `CITATION_LINK_PATTERN` in the
+# frontend's citationUtils.ts: a type the frontend strips but this resolver
+# can't back-fill would be silently dropped (no chip) when cited from context
+# rather than retrieved.
+_ENTITY_ID = r"(?:chat|task|note|project|todo|milestone):[^)\]\s]+"
+_CITATION_RE = re.compile(rf"\[[^\]]*\]\(({_ENTITY_ID})\)|\[({_ENTITY_ID})\]")
 
 # Frontend uses "my" as the URL label for personal notes; the LLM
 # tends to echo what it sees in the system prompt (which uses
@@ -78,6 +89,8 @@ TaskSourceBuilder = Callable[..., dict[str, Any]]
 ProjectSourceBuilder = Callable[..., dict[str, Any]]
 ChatSourceBuilder = Callable[..., dict[str, Any]]
 NoteSourceBuilder = Callable[..., dict[str, Any]]
+TodoSourceBuilder = Callable[..., dict[str, Any]]
+MilestoneSourceBuilder = Callable[..., dict[str, Any]]
 
 
 def resolve_unresolved_citations(
@@ -90,6 +103,8 @@ def resolve_unresolved_citations(
     build_project_source: ProjectSourceBuilder,
     build_chat_source: ChatSourceBuilder,
     build_note_source: NoteSourceBuilder,
+    build_todo_source: TodoSourceBuilder,
+    build_milestone_source: MilestoneSourceBuilder,
 ) -> list[dict[str, Any]]:
     """Return new source dicts for citation tokens not in `seen_keys`.
 
@@ -103,7 +118,7 @@ def resolve_unresolved_citations(
     if not answer:
         return []
 
-    tokens = {m.group(1) for m in _CITATION_RE.finditer(answer)}
+    tokens = {(m.group(1) or m.group(2)) for m in _CITATION_RE.finditer(answer)}
     if not tokens:
         return []
 
@@ -113,6 +128,8 @@ def resolve_unresolved_citations(
     project_ids: set[int] = set()
     note_lookups: set[tuple[str, int]] = set()
     chat_lookups: set[tuple[str, str, str | None]] = set()
+    todo_item_ids: set[int] = set()
+    milestone_ids: set[int] = set()
 
     for token in tokens:
         parts = token.split(":")
@@ -166,6 +183,25 @@ def resolve_unresolved_citations(
                 continue
             chat_lookups.add((chat_label, chat_id, thread_id))
 
+        elif etype == "todo" and len(parts) >= 4 and parts[2] == "item":
+            # `todo:YYYY-MM-DD:item:<id>`. item_id is the globally-unique
+            # PK, so the date is used only for the seen_keys check — the
+            # source's date comes from the item's group at resolve time.
+            iid = _safe_int(parts[3])
+            if iid is None:
+                continue
+            if ("todo", f"todo:{parts[1]}:item:{iid}") in seen_keys:
+                continue
+            todo_item_ids.add(iid)
+
+        elif etype == "milestone":
+            mid = _safe_int(parts[1] if len(parts) >= 2 else None)
+            if mid is None:
+                continue
+            if ("milestone", f"milestone:{mid}") in seen_keys:
+                continue
+            milestone_ids.add(mid)
+
     new_sources: list[dict[str, Any]] = []
     if task_ids:
         new_sources.extend(_resolve_tasks(task_ids, team_id, user_id, build_task_source))
@@ -175,6 +211,12 @@ def resolve_unresolved_citations(
         new_sources.extend(_resolve_notes(note_lookups, team_id, user_id, build_note_source))
     if chat_lookups:
         new_sources.extend(_resolve_chats(chat_lookups, user_id, build_chat_source))
+    if todo_item_ids:
+        new_sources.extend(_resolve_todos(todo_item_ids, team_id, user_id, build_todo_source))
+    if milestone_ids:
+        new_sources.extend(
+            _resolve_milestones(milestone_ids, team_id, user_id, build_milestone_source)
+        )
     return new_sources
 
 
@@ -445,4 +487,74 @@ def _resolve_chats(
         # will fill it (DM partner / GM name / PM project name) before
         # we emit.
         out.append(build(chat_label, chat_id, thread_id))
+    return out
+
+
+def _resolve_todos(
+    item_ids: set[int],
+    team_id: str,
+    user_id: str,
+    build: TodoSourceBuilder,
+) -> list[dict[str, Any]]:
+    # ACL is enforced in the query: a todo item is private to its group's
+    # owner, so constraining `group__user_id == the requester` means we
+    # can only ever return the caller's own items — no separate ACL pass.
+    try:
+        rows = list(
+            ToDoItem.objects.filter(
+                item_id__in=item_ids,
+                group__user_id=user_id,
+                group__team_id=team_id,
+            ).values("item_id", "title", "group__local_date")
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never break the answer
+        log.exception("citation_resolver: todo lookup failed")
+        return []
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        local_date = r["group__local_date"]
+        out.append(
+            build(
+                r["item_id"],
+                r["title"] or "",
+                local_date.isoformat() if local_date else "",
+            )
+        )
+    return out
+
+
+def _resolve_milestones(
+    milestone_ids: set[int],
+    team_id: str,
+    user_id: str,
+    build: MilestoneSourceBuilder,
+) -> list[dict[str, Any]]:
+    try:
+        rows = list(
+            MilestoneMaster.objects.filter(
+                milestone_id__in=milestone_ids,
+                team_id=team_id,
+                is_deleted=False,
+            ).values("milestone_id", "title", "project_id", "task_id")
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("citation_resolver: milestone lookup failed")
+        return []
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        allowed = milestone_acl_user_ids(r["project_id"], r["milestone_id"])
+        if user_id not in allowed:
+            continue
+        # task_id is the backing task (nullable for legacy milestones) —
+        # the frontend deep-links a milestone chip through the task view.
+        out.append(
+            build(
+                r["milestone_id"],
+                r["title"] or "",
+                r["project_id"],
+                r["task_id"],
+            )
+        )
     return out

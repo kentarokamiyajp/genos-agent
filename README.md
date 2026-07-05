@@ -1,12 +1,11 @@
-# Genos — つくって・まわして・とどける、ワークスペース AI エージェント
+# Genos — チームの文脈（チャット、タスクなど）を理解するContext OSとAI Agent
 
 > **DevOps × AI Agent Hackathon 2026 submission.** An AI agent that reads your team's
 > chats, tasks and notes as *connected project memory*, autonomously plans + uses tools
 > to answer with citations, and takes approval-gated actions — running on **Vertex AI +
 > Cloud Run**, shipped through a **CI/CD pipeline that gates every deploy on agent evals**.
 
-**Live:** https://gcp.genosai.dev · **Demo login:** `demo@genosai.dev` / `GenosDemo2026!`
-(a pre-seeded workspace — open `Cmd-K` and ask *"How is the Website Redesign project going?"*)
+**Live:** https://gcp.genosai.dev · **Demo login available** (a pre-seeded workspace — open `Cmd-K` and ask *"How is the Website Redesign project going?"*)
 
 📐 **システム構成の詳細は [ARCHITECTURE.md](ARCHITECTURE.md)**（インフラ / API / フロントエンド + 図）。
 

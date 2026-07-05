@@ -80,6 +80,7 @@ from origin.search_engine.agent.tools.get_workload_distribution import (
 )
 from origin.search_engine.agent.tools.list_calendar_events import LIST_CALENDAR_EVENTS
 from origin.search_engine.agent.tools.list_calendars import LIST_CALENDARS
+from origin.search_engine.agent.tools.list_channel_members import LIST_CHANNEL_MEMBERS
 from origin.search_engine.agent.tools.list_milestones import LIST_MILESTONES
 from origin.search_engine.agent.tools.list_my_inbox import LIST_MY_INBOX
 from origin.search_engine.agent.tools.list_my_mentions import LIST_MY_MENTIONS
@@ -88,6 +89,7 @@ from origin.search_engine.agent.tools.list_pr_comments import LIST_PR_COMMENTS
 from origin.search_engine.agent.tools.list_pr_commits import LIST_PR_COMMITS
 from origin.search_engine.agent.tools.list_pr_files import LIST_PR_FILES
 from origin.search_engine.agent.tools.list_pr_reviews import LIST_PR_REVIEWS
+from origin.search_engine.agent.tools.list_project_members import LIST_PROJECT_MEMBERS
 from origin.search_engine.agent.tools.list_projects import LIST_PROJECTS
 from origin.search_engine.agent.tools.list_sprints import LIST_SPRINTS
 from origin.search_engine.agent.tools.list_tasks import LIST_TASKS
@@ -121,6 +123,9 @@ for _t in (
     GET_TEAM_MEMBERS,
     GET_CURRENT_USER,
     GET_PROJECT_SUMMARY,
+    # --- Read tools — membership rosters (A1-ext) ---
+    LIST_PROJECT_MEMBERS,
+    LIST_CHANNEL_MEMBERS,
     # --- Write tools (Phase 11) ---
     CREATE_TASK,
     UPDATE_TASK,

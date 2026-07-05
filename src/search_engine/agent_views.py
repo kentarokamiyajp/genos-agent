@@ -579,6 +579,9 @@ class AgentAskView(AuthenticatedAPIView):
                     disabled_tools=disabled_tools,
                     system_extra=system_extra,
                     seed_sources=seed_sources,
+                    # C3 — keys the session tool-result cache. None (no
+                    # session) disables caching for this run entirely.
+                    session_id=str(session.session_id) if session else None,
                 )
             finally:
                 reset_llm_choice(token)
@@ -867,6 +870,35 @@ def _stream_ndjson(
                 "finished_at",
             ]
         )
+
+        # C1 near-real-time memory (§4.7): index this conversation into
+        # the per-user recall lane the moment it completes, so a fact
+        # from a run that ended seconds ago is already recallable in the
+        # next session. Runs AFTER the stream's last byte (this whole
+        # block executes post-yield), so its ~1 embed call adds zero
+        # user-visible latency — it only holds the worker briefly.
+        # Best-effort by design: a failure here must never mark the run
+        # failed, and the 10-minute incremental reindexer remains the
+        # backstop (hash-diff makes the overlap a no-op). Known gap,
+        # shared with the run-close code above: a client disconnect that
+        # kills the generator skips this block — the cron catches those.
+        if (
+            final_status == "done"
+            and run.final_answer_text
+            and settings.SEARCH_ENGINE.get("RAG_CONVERSATION_INDEX_ON_COMPLETE", True)
+        ):
+            try:
+                from origin.search_engine.ingestion import (  # noqa: PLC0415 — lazy: heavy module
+                    ingest_conversation_run,
+                )
+
+                ingest_conversation_run(run)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "Post-completion conversation indexing failed for %s "
+                    "(the periodic reindex will pick it up)",
+                    run.run_id,
+                )
     except Exception:  # noqa: BLE001
         log.exception("Failed to close AgentRun %s", run.run_id)
 

@@ -110,6 +110,96 @@ _MULTILINGUAL_NOTES: list[tuple[str, list[str]]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Context-boundary fixture content (A2 Phase A — hierarchical retrieval eval)
+# ---------------------------------------------------------------------------
+# Multi-section notes engineered so the CHUNK a query lexically matches
+# (title / an early "bait" section) does NOT contain the answer — the
+# fact lives in a NEIGHBORING section written to share no tokens with
+# the query. This is the classic parent-document failure mode: if the
+# agent could only see the matched small chunk, it couldn't answer.
+# The cases measure whether the pipeline (entity-level grouping with
+# up to 3 chunks + the model drilling via fetch_note) already recovers
+# the adjacent context — i.e. whether A2 (parent_chunk_id + expansion +
+# reindex) would buy anything. See cases.yaml section U.
+
+_CONTEXT_BOUNDARY_NOTES: list[tuple[str, list[tuple[str, bool]]]] = [
+    (
+        # Query bait lives in the title + first section; the decision,
+        # spend, and owner live in later sections that deliberately
+        # avoid the words "vendor", "evaluation", "analytics".
+        "Vendor evaluation for the analytics migration",
+        [
+            ("Candidates compared", True),
+            (
+                "We compared Plausible, Matomo, and PostHog for the analytics "
+                "migration. Each vendor was scored on privacy, self-hosting, "
+                "and dashboard quality during the evaluation sprint.",
+                False,
+            ),
+            ("Outcome", True),
+            (
+                "Matomo wins. The Business plan costs 79 USD per month and "
+                "Dana signs off as the decision owner. Rollout starts next sprint.",
+                False,
+            ),
+        ],
+    ),
+    (
+        # Root cause + follow-up owner live in sections whose wording
+        # avoids "root cause", "latency", and "spike".
+        "Incident retrospective: search latency spike",
+        [
+            ("Timeline", True),
+            (
+                "The search latency spike began Tuesday 09:40 and lasted 35 "
+                "minutes. Dashboards showed p95 climbing past 4 seconds.",
+                False,
+            ),
+            ("What we changed", True),
+            (
+                "The regression traced back to an unbounded wildcard prefix "
+                "query that had been added to the typeahead endpoint. Reverting "
+                "it restored normal response times immediately.",
+                False,
+            ),
+            ("Next steps", True),
+            (
+                "Priya owns the follow-up work: add a query-shape lint to CI "
+                "and a load test for the typeahead path.",
+                False,
+            ),
+        ],
+    ),
+]
+
+
+def _seed_context_boundary_notes(
+    team: TeamMaster, owner: CustomUser
+) -> list[NotePermissionMaster]:
+    """Create the A2 Phase-A notes + owner permission rows (same
+    contract as `_seed_multilingual_notes`)."""
+    permissions: list[NotePermissionMaster] = []
+    for title, blocks in _CONTEXT_BOUNDARY_NOTES:
+        body = [_ml_block(text, heading=heading) for text, heading in blocks]
+        note = PersonalNoteMaster.objects.create(
+            team=team,
+            owner=owner,
+            title=title,
+            body=body,
+        )
+        permissions.append(
+            NotePermissionMaster(
+                team=team,
+                user=owner,
+                note_id=note.note_id,
+                note_type=1,
+                role_id=1,
+            )
+        )
+    return permissions
+
+
 def _seed_multilingual_notes(team: TeamMaster, owner: CustomUser) -> list[NotePermissionMaster]:
     """Create the dedicated multilingual personal notes + their owner
     permission rows (the note APIs 403 without an explicit ROLE_OWNER
@@ -220,6 +310,11 @@ def reseed_fixture() -> dict:
         team = TeamMaster.objects.get(team_id=summary["team_id"])
         ml_permissions = _seed_multilingual_notes(team, demo_user)
         NotePermissionMaster.objects.bulk_create(ml_permissions)
+
+        # 3c. A2 Phase-A context-boundary notes (chunk-adjacency eval
+        # targets — see cases.yaml section U).
+        cb_permissions = _seed_context_boundary_notes(team, demo_user)
+        NotePermissionMaster.objects.bulk_create(cb_permissions)
 
     # 4. Reindex synchronously so the freshly-written rows are
     # searchable when the eval starts. `since_minutes=60` is generous

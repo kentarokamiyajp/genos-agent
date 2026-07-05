@@ -536,9 +536,9 @@ cycle — so their abstracts become discoverable through Spotlight.
 ## Related docs
 
 - [OPENSEARCH_COMMANDS.md](OPENSEARCH_COMMANDS.md) — handy command cheat sheet
-- [01_agentic_ai_opensearch_mvp_roadmap.md](01_agentic_ai_opensearch_mvp_roadmap.md) — original roadmap
-- [02_opensearch_mvp_search_engine_design.md](02_opensearch_mvp_search_engine_design.md) — initial design
-- [03_opensearch_mvp_implementation.md](03_opensearch_mvp_implementation.md) — initial impl notes
+- [01_agentic_ai_opensearch_mvp_roadmap.md](../mvp_roadmap/01_agentic_ai_opensearch_mvp_roadmap.md) — original roadmap
+- [02_opensearch_mvp_search_engine_design.md](../mvp_roadmap/02_opensearch_mvp_search_engine_design.md) — initial design
+- [03_opensearch_mvp_implementation.md](../mvp_roadmap/03_opensearch_mvp_implementation.md) — initial impl notes
 - [appendix_opensearch_hybrid_search_guide.md](appendix_opensearch_hybrid_search_guide.md) — RRF + hybrid-search deep-dive
-- [021_opensearch_chat_rag_chunking_summary.md](021_opensearch_chat_rag_chunking_summary.md) — chat chunking rationale
-- [SPOTLIGHT_DEMO_VIDEO_SCRIPT.md](SPOTLIGHT_DEMO_VIDEO_SCRIPT.md) — the actual demo-day prompts; ground-truth use cases for retrieval quality
+- [021_opensearch_chat_rag_chunking_summary.md](../mvp_roadmap/021_opensearch_chat_rag_chunking_summary.md) — chat chunking rationale
+- [SPOTLIGHT_DEMO_VIDEO_SCRIPT.md](../spotlight/SPOTLIGHT_DEMO_VIDEO_SCRIPT.md) — the actual demo-day prompts; ground-truth use cases for retrieval quality

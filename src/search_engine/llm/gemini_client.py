@@ -14,7 +14,10 @@ Supports two authentication modes (chosen via Django settings):
     `GEMINI_SERVICE_ACCOUNT_FILE` or `GOOGLE_APPLICATION_CREDENTIALS`.
     Also requires `GEMINI_PROJECT` (and optionally `GEMINI_LOCATION`,
     default "us-central1"). The service account needs the
-    `roles/aiplatform.user` role.
+    `roles/aiplatform.user` role. `GEMINI_LLM_LOCATION` may override the
+    region for this LLM client alone (falling back to `GEMINI_LOCATION`),
+    leaving the Vertex embedder on its own region — e.g. point the LLM at
+    `global` for a preview model while embeddings stay regional.
 """
 
 from __future__ import annotations
@@ -38,7 +41,12 @@ def _build_client() -> genai.Client:
 
     if cfg.get("GEMINI_USE_VERTEX"):
         project = cfg.get("GEMINI_PROJECT") or ""
-        location = cfg.get("GEMINI_LOCATION") or "us-central1"
+        # Prefer the LLM-specific region when set, so the agent can reach a
+        # model (e.g. a *-preview) that a shared regional endpoint doesn't
+        # serve, WITHOUT moving the Vertex embedder (which reads
+        # GEMINI_LOCATION) off the region its index was built in. Falls
+        # back to GEMINI_LOCATION, then us-central1. See settings.py.
+        location = cfg.get("GEMINI_LLM_LOCATION") or cfg.get("GEMINI_LOCATION") or "us-central1"
         sa_file = cfg.get("GEMINI_SERVICE_ACCOUNT_FILE") or ""
         if not project:
             raise RuntimeError(

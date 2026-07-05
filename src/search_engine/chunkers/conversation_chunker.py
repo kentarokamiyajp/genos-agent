@@ -8,16 +8,21 @@ search (`search()` with no entity_types) excludes the lane entirely — it is
 reachable only via the `search_past_conversations` tool, which passes
 `entity_types=["conversation"]` explicitly.
 
-Like the note/thread summary chunkers, conversations are indexed by the
-batch reindex (`ingest_all(entity_types=["conversation"])` /
-`opensearch_reindex`), NOT on the answer path — so enabling memory adds zero
-latency to the live ask.
+Conversations reach the index on two paths, both off the answer stream:
+  - the batch reindex (`ingest_all(entity_types=["conversation"])` /
+    `opensearch_reindex`) — the backstop that also catches anything the
+    completion hook missed;
+  - `ingestion.ingest_conversation_run(run)` — called by `agent_views`
+    right after a run is saved as `done`, so a fact from a conversation
+    that ended seconds ago is already recallable in the next session.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Iterator, Optional
+
+from django.db.models import Q
 
 from origin.search_engine.chunkers.base import (
     Chunk,
@@ -35,49 +40,69 @@ _INDEXABLE_STATUS = "done"
 _MAX_ANSWER_CHARS = 4000
 
 
+def conversation_chunks_for_run(run: AgentRun) -> Optional[EntityChunks]:
+    """Build the (single-chunk) `EntityChunks` for one AgentRun, or None
+    when the run isn't durable memory: wrong status, empty query/answer,
+    or missing user/team scope. Pure — no queries, no I/O — so both the
+    batch iterator below and the on-completion hook share one definition
+    of "what a conversation chunk is"."""
+    if run.status != _INDEXABLE_STATUS:
+        return None
+    query = (run.query or "").strip()
+    answer = (run.final_answer_text or "").strip()
+    user_id = str(run.user_id or "")
+    team_id = str(run.team_id or "")
+    if not query or not answer or not user_id or not team_id:
+        return None
+
+    if len(answer) > _MAX_ANSWER_CHARS:
+        answer = answer[:_MAX_ANSWER_CHARS] + "…"
+
+    entity_id = f"conversation:{run.run_id}"
+    # search_text carries BOTH the question and the answer so a recall
+    # query ("what did I decide about the perf budget?") matches on
+    # either side. The title is the original question — the most useful
+    # one-line handle when the chunk surfaces as a source.
+    search_text = f"Q: {query}\nA: {answer}"
+
+    chunk = Chunk(
+        chunk_id=entity_id,
+        entity_type="conversation",
+        entity_id=entity_id,
+        chunk_type="conversation",
+        team_id=team_id,
+        # Per-user lane: only the asker can recall their own past Q&A.
+        acl_user_ids=[user_id],
+        title=query if len(query) <= 200 else query[:197] + "…",
+        search_text=search_text,
+        snippet_text=make_snippet(answer),
+        related_entity_ids=[],
+        created_at=iso(run.started_at),
+        updated_at=iso(run.finished_at or run.started_at),
+    )
+    return EntityChunks(
+        entity_type="conversation",
+        entity_id=entity_id,
+        chunks=[chunk],
+    )
+
+
 def iter_conversation_chunks(since: Optional[datetime] = None) -> Iterator[EntityChunks]:
     qs = AgentRun.objects.filter(status=_INDEXABLE_STATUS).exclude(final_answer_text="")
     if since is not None:
-        # finished_at is the completion time; fall back to started_at for
-        # rows finished before that column was populated.
-        qs = qs.filter(started_at__gte=since)
+        # Window on COMPLETION time, not start time: the incremental
+        # reindexer passes `--since-minutes 11` on a 10-minute cron, so a
+        # run *started* before the window but *finished* inside it (long
+        # tool loops, an `awaiting_approval` run resumed later) would
+        # otherwise slip past every incremental pass and only ever be
+        # indexed by a manual full reindex. Legacy rows saved before
+        # `finished_at` was populated fall back to `started_at`.
+        qs = qs.filter(
+            Q(finished_at__gte=since) | Q(finished_at__isnull=True, started_at__gte=since)
+        )
     qs = qs.order_by("started_at")
 
     for run in qs.iterator():
-        query = (run.query or "").strip()
-        answer = (run.final_answer_text or "").strip()
-        user_id = str(run.user_id or "")
-        team_id = str(run.team_id or "")
-        if not query or not answer or not user_id or not team_id:
-            continue
-
-        if len(answer) > _MAX_ANSWER_CHARS:
-            answer = answer[:_MAX_ANSWER_CHARS] + "…"
-
-        entity_id = f"conversation:{run.run_id}"
-        # search_text carries BOTH the question and the answer so a recall
-        # query ("what did I decide about the perf budget?") matches on
-        # either side. The title is the original question — the most useful
-        # one-line handle when the chunk surfaces as a source.
-        search_text = f"Q: {query}\nA: {answer}"
-
-        chunk = Chunk(
-            chunk_id=entity_id,
-            entity_type="conversation",
-            entity_id=entity_id,
-            chunk_type="conversation",
-            team_id=team_id,
-            # Per-user lane: only the asker can recall their own past Q&A.
-            acl_user_ids=[user_id],
-            title=query if len(query) <= 200 else query[:197] + "…",
-            search_text=search_text,
-            snippet_text=make_snippet(answer),
-            related_entity_ids=[],
-            created_at=iso(run.started_at),
-            updated_at=iso(run.finished_at or run.started_at),
-        )
-        yield EntityChunks(
-            entity_type="conversation",
-            entity_id=entity_id,
-            chunks=[chunk],
-        )
+        entity = conversation_chunks_for_run(run)
+        if entity is not None:
+            yield entity

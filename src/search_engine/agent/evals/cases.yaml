@@ -454,6 +454,26 @@
     citations_count_at_least: 2
     no_errors: true
 
+- id: multi_turn_citation_style_followup
+  # Reproduces the 2026-07-05 gemini-flash citation malformation flow
+  # verbatim: TURN 2 of a session — with turn 1's thread-fetch results
+  # in context — is where the weak model degraded to `[token](token)`
+  # link labels and invented `chat:…:msg:<uuid>` ids (AgentRun
+  # cabd15b1). `citation_style_metric` (metric-only) feeds
+  # `citation_wellformed_rate` from this exact scenario WITHOUT a
+  # binary `has_citations` assertion — flash only sometimes cites on
+  # this follow-up, and a stochastic assertion would flake the
+  # deploy-gating suite. A style regression moves the aggregate metric
+  # instead of going unmeasured.
+  fixture: true
+  turns:
+    - query: "Why did we rule out framer-motion?"
+    - query: "And what's the in-app animation decision?"
+      expect:
+        answer_contains_all: ["framer-motion"]
+        citation_style_metric: true
+        no_errors: true
+
 # --------------------------------------------------------------------- #
 # M. List / filter tasks (structural queries)                           #
 # --------------------------------------------------------------------- #
@@ -721,4 +741,135 @@
     tool_calls_at_least: 1
     answer_contains_all: ["hero", "plausible", "interview", "roadmap", "framer"]
     has_citations: true
+    no_errors: true
+
+# --------------------------------------------------------------------- #
+# T. D5 natural-prose inline citations (§4.6)                           #
+# --------------------------------------------------------------------- #
+# These cases force multi-source, grounded answers with citation
+# expectations so both D5 metrics have a population:
+#   - prose_citation_rate (deterministic): link-form / all citations —
+#     is the model actually adopting `[descriptive prose](type:id)`?
+#   - prose_faithfulness (judge, nullable): does the link text honestly
+#     describe the cited source? Scored only when link-form citations
+#     exist; run with --judge to populate it.
+# The existing L-section cases assert citation *discipline* (when to
+# cite); this section measures citation *style and honesty*.
+
+- id: prose_cite_project_status
+  # Multi-entity project rollup — plenty of concrete entities to cite,
+  # so a compliant answer should carry several link-form citations.
+  query: "How is the Website Redesign project going, and what's the biggest risk right now?"
+  fixture: true
+  expect:
+    tool_calls_at_least: 1
+    answer_contains_any: ["hero", "accessibility", "plausible", "redesign"]
+    has_citations: true
+    no_errors: true
+
+- id: prose_cite_decision_from_thread
+  # The framer-motion decision lives in a CHAT THREAD, not the task —
+  # exercises prose-faithfulness grading against a title-only chat
+  # source (structured-tool sources carry no snippet), and the §4.6
+  # discipline rule that the *thread* is the citable source.
+  query: "What did the team decide about framer-motion, and why?"
+  fixture: true
+  expect:
+    tool_calls_at_least: 1
+    answer_contains_any: ["css", "framer"]
+    has_citations: true
+    no_errors: true
+
+- id: prose_cite_multi_source_summary
+  # Cross-project multi-fact answer → several distinct sources cited in
+  # one answer; the adoption rate is most meaningful here because a
+  # partial fallback (some prose links, some bare tokens) lands between
+  # 0 and 1 instead of being all-or-nothing.
+  query: "Summarize what's in progress across my projects and who is waiting on what."
+  fixture: true
+  expect:
+    tool_calls_at_least: 1
+    citations_count_at_least: 2
+    no_errors: true
+
+# --------------------------------------------------------------------- #
+# U. A2 Phase A — context-boundary recall (hierarchical retrieval eval) #
+# --------------------------------------------------------------------- #
+# Eval-first probe for A2 parent-document retrieval (§2 of the future-
+# architecture doc). Each query lexically matches ONE chunk of a multi-
+# section fixture note (title or a "bait" section), while the answer
+# fact lives in a NEIGHBORING section written to avoid the query's
+# words (see fixture.py `_CONTEXT_BOUNDARY_NOTES`). If the small chunk
+# were all the pipeline could see, these would fail — so:
+#   GREEN here = the agent path already recovers adjacent context
+#     (entity grouping ships up to 3 chunks + the model drills via
+#     fetch_note), i.e. A2's schema+reindex investment buys nothing on
+#     this surface and the item closes as "measured, not needed".
+#   RED here = the concrete target Phase B (parent_chunk_id + post-hit
+#     expansion) must turn green.
+
+- id: context_boundary_vendor_decision
+  # Query words ("vendor evaluation", "analytics") live in the title +
+  # "Candidates compared" section; the decision lives in "Outcome",
+  # which never says vendor/evaluation/analytics.
+  query: "What did the vendor evaluation for the analytics migration conclude?"
+  fixture: true
+  expect:
+    tool_calls_at_least: 1
+    answer_contains_any: ["matomo"]
+    no_errors: true
+
+- id: context_boundary_vendor_budget_owner
+  # Same note, different adjacent facts: monthly spend + decision owner.
+  query: "How much will we pay monthly after the analytics vendor evaluation, and who owns the decision?"
+  fixture: true
+  expect:
+    tool_calls_at_least: 1
+    answer_contains_all: ["79", "dana"]
+    no_errors: true
+
+- id: context_boundary_incident_root_cause
+  # "Root cause" appears nowhere in the note; the fact section is
+  # titled "What we changed" and avoids latency/spike wording.
+  query: "What was the root cause of the search latency spike?"
+  fixture: true
+  expect:
+    tool_calls_at_least: 1
+    answer_contains_any: ["wildcard", "typeahead"]
+    no_errors: true
+
+- id: context_boundary_incident_follow_up_owner
+  # Owner named only in the final "Next steps" section.
+  query: "Who owns the follow-up actions from the search latency retrospective?"
+  fixture: true
+  expect:
+    tool_calls_at_least: 1
+    answer_contains_any: ["priya"]
+    no_errors: true
+
+# --------------------------------------------------------------------- #
+# V. Membership rosters (A1-ext — list_project_members / channel)       #
+# --------------------------------------------------------------------- #
+# The membership graph existed only as an ACL guard; nothing let the
+# agent ANSWER "who is on project X?" (get_team_members is team-grain).
+# These lock in the routing: project-grain questions hit the new tool,
+# and team-grain questions still hit get_team_members (the
+# disambiguation case guards the cheat-sheet edit against regression).
+
+- id: members_of_website_redesign
+  query: "Who is on the Website Redesign project?"
+  fixture: true
+  expect:
+    tools_used_contains: ["list_project_members"]
+    # Every fixture project is staffed by the demo user + the four
+    # seeded bots; a real roster answer names several of them.
+    answer_contains_all: ["alice", "bob", "carol"]
+    no_errors: true
+
+- id: team_vs_project_members_disambiguation
+  query: "Who is on this team?"
+  fixture: true
+  expect:
+    tools_used_contains: ["get_team_members"]
+    tools_used_excludes: ["list_project_members"]
     no_errors: true

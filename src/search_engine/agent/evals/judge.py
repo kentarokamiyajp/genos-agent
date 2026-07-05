@@ -60,13 +60,18 @@ You will be given:
     only carry the entity title; the real data (status, priority,
     due_date, counts, names) lives in TOOL_RESULTS. Treat
     TOOL_RESULTS as ground truth alongside SOURCES.
-  - The system's ANSWER (markdown; may contain inline citations
-    formatted as [task:N], [chat:dm:N:thread:N], [note:type:N], or
-    [project:N]). Chat-type letters: `dm` = direct message,
-    `gm` = group message (team channel), `pm` = project message
-    (chat tied to a project — NOT "private message"), `mdm` = multi-DM.
+  - The system's ANSWER (markdown; may contain inline citations in
+    two forms: a natural-prose link `[descriptive prose](task:N)`
+    whose URL is the entity id, or a bare token like [task:N],
+    [chat:dm:N:thread:N], [note:type:N], [project:N]). Chat-type
+    letters: `dm` = direct message, `gm` = group message (team
+    channel), `pm` = project message (chat tied to a project — NOT
+    "private message"), `mdm` = multi-DM.
+  - PROSE_CITATIONS: the link-form citations extracted from the
+    ANSWER, one per line — the visible link text, the id it cites,
+    and the retrieved source's title for that id (when resolved).
 
-Score three dimensions, each on a 0.0–1.0 scale:
+Score four dimensions, each on a 0.0–1.0 scale:
 
   1. faithfulness — every factual claim in the ANSWER is supported
      by at least one SOURCE snippet OR by a field in TOOL_RESULTS.
@@ -95,6 +100,19 @@ Score three dimensions, each on a 0.0–1.0 scale:
      Missing a major point a source explicitly addresses = lower.
      1.0 = nothing important omitted. 0.0 = mostly missed the point.
 
+  4. prose_faithfulness — for each entry in PROSE_CITATIONS, the
+     visible link TEXT truthfully describes what the cited source
+     is or says (per its title, snippet, and TOOL_RESULTS data).
+     This is the D5 hallucinated-prose axis: prose that describes
+     the source as something it isn't ("[the decision to ship
+     Friday](task:42)" when task:42 says nothing of the sort) is
+     worse than no citation, because the link lends false authority.
+     Judge ONLY the link text vs the cited source — sentence-level
+     claim support is axis 1, and whether the right source was
+     picked is axis 2. Applies ONLY to link-form citations: when
+     PROSE_CITATIONS is empty, return null for this axis (not 0.0).
+     1.0 = every link text honest. 0.0 = descriptions fabricated.
+
 Be strict — a 1.0 means you have no concerns. Most real answers
 should land in 0.6–0.9 unless they're perfect.
 
@@ -104,6 +122,7 @@ Respond with a single JSON object, no prose, no markdown fences:
   "faithfulness": <0.0-1.0>,
   "citation_precision": <0.0-1.0>,
   "completeness": <0.0-1.0>,
+  "prose_faithfulness": <0.0-1.0 or null>,
   "notes": "one short sentence explaining the lowest score"
 }
 """
@@ -111,6 +130,25 @@ Respond with a single JSON object, no prose, no markdown fences:
 # Match a fenced JSON block as a fallback parsing path. Some models
 # wrap JSON in ```json … ``` despite the instruction not to.
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+
+# Link-form citation PAIR extractor: captures (visible prose label,
+# cited entity id) from `[prose](type:id)`. This is deliberately a
+# different tool from the id-only scanners (`_CITATION_RE` in
+# runner.py / `_INLINE_CITATION_RE` in controller.py, which throw the
+# label away): the D5 prose-faithfulness axis judges the LABEL against
+# the cited source, so both halves are needed. Anchored to the known
+# entity-type vocabulary so ordinary markdown links (https://…,
+# mailto:…) never count as citations. Keep the type list in sync with
+# the frontend's CITATION_LINK_PATTERN in citationUtils.ts.
+CITATION_LINK_RE = re.compile(
+    r"\[([^\]]+)\]\(((?:chat|task|note|project|todo|milestone)(?::[a-z0-9_\-]+)+)\)"
+)
+
+
+def extract_prose_citations(answer: str) -> list[tuple[str, str]]:
+    """Return the (link text, cited id) pairs of every link-form
+    citation in `answer`, in document order."""
+    return [(m.group(1), m.group(2)) for m in CITATION_LINK_RE.finditer(answer or "")]
 
 
 def judge_answer(
@@ -131,8 +169,20 @@ def judge_answer(
 
     On any parsing or call failure returns `{"error": <reason>}` plus
     the same three score keys at 0.0 — caller can still aggregate.
+
+    The fourth axis, `prose_faithfulness` (D5, §4.6), is NULLABLE:
+    it scores whether each `[prose](type:id)` link's visible text
+    truthfully describes the cited source, so it only exists when the
+    answer contains link-form citations. `None` means "no link-form
+    citations to judge" — callers must skip it in means, never coerce
+    to 0.0 (that would punish answers for citing in the bare form).
     """
-    user_prompt = _build_user_prompt(query, sources, answer, tool_results or [])
+    # Deterministic extraction of the link-form (label, id) pairs. The
+    # judge only *grades* prose it can see listed; the extraction is
+    # ours so an answer with zero link citations gets a forced None
+    # regardless of what the model returns.
+    prose_citations = extract_prose_citations(answer)
+    user_prompt = _build_user_prompt(query, sources, answer, tool_results or [], prose_citations)
     client = get_model_client()
 
     try:
@@ -159,6 +209,20 @@ def judge_answer(
             parsed[k] = max(0.0, min(1.0, float(parsed.get(k, 0))))
         except (TypeError, ValueError):
             parsed[k] = 0.0
+    # prose_faithfulness is nullable, and the deterministic extractor is
+    # authoritative about WHEN it applies: no link-form citations in the
+    # answer → force None even if the judge emitted a number (models
+    # sometimes return 0.0 instead of null, which would silently drag
+    # the aggregate down for bare-form answers).
+    if not prose_citations:
+        parsed["prose_faithfulness"] = None
+    else:
+        try:
+            parsed["prose_faithfulness"] = max(
+                0.0, min(1.0, float(parsed.get("prose_faithfulness")))
+            )
+        except (TypeError, ValueError):
+            parsed["prose_faithfulness"] = None
     parsed.setdefault("notes", "")
     return parsed
 
@@ -168,6 +232,7 @@ def _build_user_prompt(
     sources: list[dict[str, Any]],
     answer: str,
     tool_results: list[dict[str, Any]],
+    prose_citations: list[tuple[str, str]] | None = None,
 ) -> str:
     """Compose the user-side of the judge prompt.
 
@@ -181,6 +246,10 @@ def _build_user_prompt(
     hallucinations happen, so we keep those verbatim, but head/tail
     any long string field so a 100-message `fetch_chat_thread` or a
     task with 20 long comments doesn't blow up the judge prompt.
+
+    `prose_citations` (D5) are the pre-extracted `[label](id)` pairs;
+    each is rendered next to the resolved source title so the judge
+    grades label-vs-source directly instead of re-parsing the answer.
     """
     src_lines: list[str] = []
     for i, src in enumerate(sources, start=1):
@@ -205,10 +274,35 @@ def _build_user_prompt(
 
     tools_block = "\n".join(tool_lines) if tool_lines else "  (no tool calls)"
 
+    # PROSE_CITATIONS (D5) — resolve each cited id to its source title
+    # so the judge can grade the link text without cross-referencing.
+    # Chat entity_ids ship without the `chat:` prefix from the chunker
+    # (e.g. "dm:9:thread:4"), so normalise the lookup key the same way
+    # the frontend and controller do.
+    by_token: dict[str, dict[str, Any]] = {}
+    for src in sources:
+        eid = str(src.get("entity_id") or "")
+        etype = str(src.get("entity_type") or "")
+        if not eid:
+            continue
+        key = eid if eid.startswith(f"{etype}:") else f"{etype}:{eid}"
+        by_token[key] = src
+    prose_lines: list[str] = []
+    for i, (label, cited_id) in enumerate(prose_citations or [], start=1):
+        src = by_token.get(cited_id)
+        resolved = (
+            f'source title: "{(src.get("title") or "").strip() or "(untitled)"}"'
+            if src
+            else "(id not among retrieved sources)"
+        )
+        prose_lines.append(f'  {i}. link text: "{label}" -> cites: {cited_id} -> {resolved}')
+    prose_block = "\n".join(prose_lines) if prose_lines else "  (no link-form citations)"
+
     return (
         f"QUERY:\n  {query}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
         f"TOOL_RESULTS:\n{tools_block}\n\n"
+        f"PROSE_CITATIONS:\n{prose_block}\n\n"
         f"ANSWER:\n{answer}\n"
     )
 
@@ -270,6 +364,9 @@ def _error_scores(reason: str) -> dict[str, Any]:
         "faithfulness": 0.0,
         "citation_precision": 0.0,
         "completeness": 0.0,
+        # Nullable axis: an errored judge call tells us nothing about
+        # prose faithfulness, so don't poison the aggregate with 0.0.
+        "prose_faithfulness": None,
         "notes": "",
         "error": reason,
     }

@@ -16,6 +16,7 @@ locals {
     "cloudresourcemanager.googleapis.com", # project IAM bindings
     "serviceusage.googleapis.com",
     "cloudbuild.googleapis.com",
+    "cloudscheduler.googleapis.com", # cron triggers for the Cloud Run maintenance jobs
   ]
 }
 

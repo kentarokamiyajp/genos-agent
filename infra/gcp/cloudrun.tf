@@ -91,6 +91,16 @@ resource "google_cloud_run_v2_service" "api" {
         name  = "GEMINI_LOCATION"
         value = var.vertex_location
       }
+      # LLM-only region override. Empty by default → the app falls back to
+      # GEMINI_LOCATION (above). Set var.vertex_llm_location to reach a Gemini
+      # model that var.vertex_location doesn't serve (e.g. a *-preview on the
+      # `global` endpoint) WITHOUT moving the Vertex embedder / reindex job off
+      # var.vertex_location — the region its OpenSearch index was built in.
+      # See infra/gcp/README.md "Vertex model + region".
+      env {
+        name  = "GEMINI_LLM_LOCATION"
+        value = var.vertex_llm_location
+      }
       env {
         name  = "EMBEDDING_PROVIDER"
         value = var.embedding_provider
@@ -149,6 +159,160 @@ resource "google_cloud_run_v2_service" "api" {
           secret_key_ref {
             secret  = google_secret_manager_secret.managed["genos-django-secret"].secret_id
             version = "latest"
+          }
+        }
+      }
+
+      # --- OAuth login (optional; inert unless a client ID is set in var.oauth).
+      # Each provider is wired ONLY when its client ID is non-empty, so by
+      # default this references no Secret Manager version — critical, because a
+      # secret_key_ref to an unseeded (versionless) secret makes the revision
+      # fail to start. Enabling a provider therefore requires, in order:
+      # (1) seed genos-<p>-oauth-secret + genos-oauth-token-key versions,
+      # (2) set var.oauth.<p>_client_id in tfvars, (3) `terraform apply` — this
+      # change does NOT ride the image-only CI deploy. See README + variables.tf.
+      dynamic "env" {
+        for_each = var.oauth.google_client_id != "" ? [1] : []
+        content {
+          name  = "GOOGLE_OAUTH_CLIENT_ID"
+          value = var.oauth.google_client_id
+        }
+      }
+      dynamic "env" {
+        for_each = var.oauth.google_client_id != "" ? [1] : []
+        content {
+          name = "GOOGLE_OAUTH_CLIENT_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.manual["genos-google-oauth-secret"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+      dynamic "env" {
+        for_each = var.oauth.github_client_id != "" ? [1] : []
+        content {
+          name  = "GITHUB_OAUTH_CLIENT_ID"
+          value = var.oauth.github_client_id
+        }
+      }
+      dynamic "env" {
+        for_each = var.oauth.github_client_id != "" ? [1] : []
+        content {
+          name = "GITHUB_OAUTH_CLIENT_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.manual["genos-github-oauth-secret"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+      # Fernet key for tokens stored at rest. REQUIRED by the login callback
+      # (crypto.encrypt runs on every OAuth sign-in), not connect-only — wire it
+      # whenever EITHER provider is enabled.
+      dynamic "env" {
+        for_each = (var.oauth.google_client_id != "" || var.oauth.github_client_id != "") ? [1] : []
+        content {
+          name = "OAUTH_TOKEN_ENCRYPTION_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.manual["genos-oauth-token-key"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+      # Tavily API key for the agent's `search_web` tool. Optional — the tool is
+      # always registered but no-ops with a "not configured" ToolError when the
+      # key is absent. Wired only when var.tavily_enabled; seed the
+      # genos-tavily-api-key secret version FIRST (Cloud Run won't start a
+      # revision referencing an unversioned secret). See README.
+      dynamic "env" {
+        for_each = var.tavily_enabled ? [1] : []
+        content {
+          name = "TAVILY_API_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.manual["genos-tavily-api-key"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
+      # --- Feature-parity secrets mirrored from Railway (each gated on its own
+      # var.<feature>_enabled; seed the secret version FIRST). ---
+
+      # Transactional email (Resend). Off ⇒ api uses the console backend (no send).
+      dynamic "env" {
+        for_each = var.email_enabled ? [1] : []
+        content {
+          name  = "EMAIL_BACKEND"
+          value = "anymail.backends.resend.EmailBackend"
+        }
+      }
+      dynamic "env" {
+        for_each = var.email_enabled ? [1] : []
+        content {
+          name  = "DEFAULT_FROM_EMAIL"
+          value = var.email_from
+        }
+      }
+      dynamic "env" {
+        for_each = var.email_enabled ? [1] : []
+        content {
+          name = "RESEND_API_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.manual["genos-resend-api-key"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
+      # Anthropic Claude (user-selectable model). Model + max-tokens use code
+      # defaults; only the key is wired.
+      dynamic "env" {
+        for_each = var.claude_enabled ? [1] : []
+        content {
+          name = "CLAUDE_API_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.manual["genos-claude-api-key"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
+      # Web Push (VAPID). Public key + admin email are plain; private key is a
+      # secret. The public key MUST equal the frontend's VITE_VAPID_PUBLIC_KEY.
+      dynamic "env" {
+        for_each = var.webpush_enabled ? [1] : []
+        content {
+          name  = "WEBPUSH_VAPID_PUBLIC_KEY"
+          value = var.webpush_vapid_public_key
+        }
+      }
+      dynamic "env" {
+        for_each = var.webpush_enabled ? [1] : []
+        content {
+          name  = "WEBPUSH_VAPID_ADMIN_EMAIL"
+          value = var.webpush_vapid_admin_email
+        }
+      }
+      dynamic "env" {
+        for_each = var.webpush_enabled ? [1] : []
+        content {
+          name = "WEBPUSH_VAPID_PRIVATE_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.manual["genos-webpush-vapid-private-key"].secret_id
+              version = "latest"
+            }
           }
         }
       }

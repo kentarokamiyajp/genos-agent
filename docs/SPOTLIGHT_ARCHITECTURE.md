@@ -584,7 +584,7 @@ Used for:
 
 ### Configuration
 
-All knobs live in `SEARCH_ENGINE["..."]` in [settings.py](../backend_django/apis/settings.py). Provider env vars (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `COHERE_API_KEY`, `TAVILY_API_KEY`, GitHub/Google OAuth client IDs) are read directly. Switching primary models is documented in [MODEL_SWITCHING.md](MODEL_SWITCHING.md).
+All knobs live in `SEARCH_ENGINE["..."]` in [settings.py](../backend_django/apis/settings.py). Provider env vars (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `COHERE_API_KEY`, `TAVILY_API_KEY`, GitHub/Google OAuth client IDs) are read directly. Switching primary models is documented in [MODEL_SWITCHING.md](../operations/MODEL_SWITCHING.md).
 
 ---
 
@@ -596,22 +596,22 @@ The phase docs cover the per-feature implementation details — start with the o
 
 | Doc | Topic |
 |---|---|
-| [01_agentic_ai_opensearch_mvp_roadmap.md](01_agentic_ai_opensearch_mvp_roadmap.md) | Original MVP plan |
-| [02_opensearch_mvp_search_engine_design.md](02_opensearch_mvp_search_engine_design.md) | Search engine design decisions |
-| [021_opensearch_chat_rag_chunking_summary.md](021_opensearch_chat_rag_chunking_summary.md) | Chunking strategy for chat data |
-| [03_opensearch_mvp_implementation.md](03_opensearch_mvp_implementation.md) | First implementation pass |
-| [04_spotlight_agentic_ai_implementation.md](04_spotlight_agentic_ai_implementation.md) | Spotlight UI shell phases 1-2 |
-| [05_agent_phase3_implementation.md](05_agent_phase3_implementation.md) | The tool-calling agent loop (this is the deep dive on §5) |
-| [06_agent_phase4_implementation.md](06_agent_phase4_implementation.md) | Hardening, safety, observability |
-| [07_agent_phase5_implementation.md](07_agent_phase5_implementation.md) | Provider abstraction + Claude adapter |
-| [08_agent_phase6_implementation.md](08_agent_phase6_implementation.md) | RAG quality: retrieval evals, freshness, dedup, reranker |
-| [09_agent_phase7_implementation.md](09_agent_phase7_implementation.md) | Write-tool approval protocol (the deep dive on §6 write tools) |
-| [10_agent_phase8_implementation.md](10_agent_phase8_implementation.md) | Multi-turn session memory |
-| [11_agent_phase9_implementation.md](11_agent_phase9_implementation.md) | Chunking refactor (heading-aware notes + chat context windows) |
-| [12_agent_phase10_implementation.md](12_agent_phase10_implementation.md) | LLM query rewriting |
-| [13_agent_phase11_implementation.md](13_agent_phase11_implementation.md) | Write-tool surface expansion |
-| [14_agent_phase13_14_implementation.md](14_agent_phase13_14_implementation.md) | Internal tool expansion + web search + feature gating |
-| [15_url_link_modal_implementation.md](15_url_link_modal_implementation.md) | UrlLinkModal (used by inline-citation preview) |
+| [01_agentic_ai_opensearch_mvp_roadmap.md](../mvp_roadmap/01_agentic_ai_opensearch_mvp_roadmap.md) | Original MVP plan |
+| [02_opensearch_mvp_search_engine_design.md](../mvp_roadmap/02_opensearch_mvp_search_engine_design.md) | Search engine design decisions |
+| [021_opensearch_chat_rag_chunking_summary.md](../mvp_roadmap/021_opensearch_chat_rag_chunking_summary.md) | Chunking strategy for chat data |
+| [03_opensearch_mvp_implementation.md](../mvp_roadmap/03_opensearch_mvp_implementation.md) | First implementation pass |
+| [04_spotlight_agentic_ai_implementation.md](../mvp_roadmap/04_spotlight_agentic_ai_implementation.md) | Spotlight UI shell phases 1-2 |
+| [05_agent_phase3_implementation.md](../mvp_roadmap/05_agent_phase3_implementation.md) | The tool-calling agent loop (this is the deep dive on §5) |
+| [06_agent_phase4_implementation.md](../mvp_roadmap/06_agent_phase4_implementation.md) | Hardening, safety, observability |
+| [07_agent_phase5_implementation.md](../mvp_roadmap/07_agent_phase5_implementation.md) | Provider abstraction + Claude adapter |
+| [08_agent_phase6_implementation.md](../mvp_roadmap/08_agent_phase6_implementation.md) | RAG quality: retrieval evals, freshness, dedup, reranker |
+| [09_agent_phase7_implementation.md](../mvp_roadmap/09_agent_phase7_implementation.md) | Write-tool approval protocol (the deep dive on §6 write tools) |
+| [10_agent_phase8_implementation.md](../mvp_roadmap/10_agent_phase8_implementation.md) | Multi-turn session memory |
+| [11_agent_phase9_implementation.md](../mvp_roadmap/11_agent_phase9_implementation.md) | Chunking refactor (heading-aware notes + chat context windows) |
+| [12_agent_phase10_implementation.md](../mvp_roadmap/12_agent_phase10_implementation.md) | LLM query rewriting |
+| [13_agent_phase11_implementation.md](../mvp_roadmap/13_agent_phase11_implementation.md) | Write-tool surface expansion |
+| [14_agent_phase13_14_implementation.md](../mvp_roadmap/14_agent_phase13_14_implementation.md) | Internal tool expansion + web search + feature gating |
+| [15_url_link_modal_implementation.md](../mvp_roadmap/15_url_link_modal_implementation.md) | UrlLinkModal (used by inline-citation preview) |
 
 ### Operational / reference
 
@@ -619,11 +619,11 @@ The phase docs cover the per-feature implementation details — start with the o
 |---|---|
 | [SPOTLIGHT_OPTIMIZATION_ROADMAP.md](SPOTLIGHT_OPTIMIZATION_ROADMAP.md) | Sequenced optimisation plan + measured outcomes per phase |
 | [SPOTLIGHT_DEMO_VIDEO_SCRIPT.md](SPOTLIGHT_DEMO_VIDEO_SCRIPT.md) | Demo prompts that exercise each path |
-| [appendix_opensearch_hybrid_search_guide.md](appendix_opensearch_hybrid_search_guide.md) | OpenSearch hybrid-search internals (BM25 + dense + RRF) |
-| [MODEL_SWITCHING.md](MODEL_SWITCHING.md) | How to swap LLM and embedding providers |
-| [OPENSEARCH_COMMANDS.md](OPENSEARCH_COMMANDS.md) | Operator commands (recreate index, reindex, etc.) |
-| [BACKEND_SCALING.md](BACKEND_SCALING.md) | Scaling notes for the Django backend |
-| [HOW_TO_TEST.md](HOW_TO_TEST.md) | Test suites (Django + frontend) |
+| [appendix_opensearch_hybrid_search_guide.md](../search/appendix_opensearch_hybrid_search_guide.md) | OpenSearch hybrid-search internals (BM25 + dense + RRF) |
+| [MODEL_SWITCHING.md](../operations/MODEL_SWITCHING.md) | How to swap LLM and embedding providers |
+| [OPENSEARCH_COMMANDS.md](../search/OPENSEARCH_COMMANDS.md) | Operator commands (recreate index, reindex, etc.) |
+| [BACKEND_SCALING.md](../operations/BACKEND_SCALING.md) | Scaling notes for the Django backend |
+| [HOW_TO_TEST.md](../operations/HOW_TO_TEST.md) | Test suites (Django + frontend) |
 
 ---
 

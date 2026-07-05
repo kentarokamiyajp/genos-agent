@@ -288,6 +288,12 @@ class AgentRunJudgement(models.Model):
     faithfulness = models.FloatField(default=0.0)
     citation_precision = models.FloatField(default=0.0)
     completeness = models.FloatField(default=0.0)
+    # D5 (§4.6) — truthfulness of `[prose](type:id)` link text vs the
+    # cited source. NULLABLE, unlike the three axes above: an answer
+    # with no link-form citations has nothing to score, and coercing
+    # that to 0.0 would poison the production trend. Aggregators must
+    # use Avg (skips NULLs), never treat None as zero.
+    prose_faithfulness = models.FloatField(blank=True, default=None, null=True)
     notes = models.TextField(blank=True, default="")
     # Which model produced this score — recorded for reproducibility when
     # the active provider/model changes between sampling passes.

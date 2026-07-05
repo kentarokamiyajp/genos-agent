@@ -292,11 +292,17 @@ class Command(BaseCommand):
         if r.judge_scores is not None:
             j = r.judge_scores
             note = j.get("error") or j.get("notes") or ""
+            # prose_faithfulness (D5) is nullable — None = the answer had
+            # no link-form citations to score, shown as n/a, never 0.
+            prose = j.get("prose_faithfulness")
+            prose_part = f" prose={prose:.2f}" if prose is not None else " prose=n/a"
             self.stdout.write(
                 "        "
                 f"judge: faith={j.get('faithfulness', 0):.2f} "
                 f"cite={j.get('citation_precision', 0):.2f} "
-                f"compl={j.get('completeness', 0):.2f}" + (f"  — {note}" if note else "")
+                f"compl={j.get('completeness', 0):.2f}"
+                + prose_part
+                + (f"  — {note}" if note else "")
             )
         if r.metrics:
             parts = "  ".join(f"{k}={v:.3f}" for k, v in sorted(r.metrics.items()))
@@ -323,12 +329,24 @@ class Command(BaseCommand):
                     vals = [r.judge_scores.get(key, 0.0) for r in judged]
                     return sum(vals) / len(vals)
 
+                # Nullable axis (D5): mean over the cases where it applies
+                # (answers with link-form citations), n reported separately.
+                prose_vals = [
+                    r.judge_scores["prose_faithfulness"]
+                    for r in judged
+                    if r.judge_scores.get("prose_faithfulness") is not None
+                ]
+                prose_part = (
+                    f"  prose={sum(prose_vals) / len(prose_vals):.2f} (n={len(prose_vals)})"
+                    if prose_vals
+                    else "  prose=n/a"
+                )
                 self.stdout.write(
                     self.style.NOTICE(
                         f"\nLLM judge ({len(judged)} cases): "
                         f"faith={_avg('faithfulness'):.2f}  "
                         f"cite={_avg('citation_precision'):.2f}  "
-                        f"compl={_avg('completeness'):.2f}"
+                        f"compl={_avg('completeness'):.2f}" + prose_part
                     )
                 )
 

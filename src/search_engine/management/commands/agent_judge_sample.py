@@ -203,6 +203,10 @@ class Command(CronCommand):
         skipped_ungrounded = 0
         errors = 0
         score_sums = {"faithfulness": 0.0, "citation_precision": 0.0, "completeness": 0.0}
+        # prose_faithfulness (D5) is nullable — None means "no link-form
+        # citations in this answer" — so it needs its own n for the mean.
+        prose_sum = 0.0
+        prose_n = 0
 
         for run in sampled:
             sources = reconstruct_sources_for_run(run)
@@ -226,12 +230,14 @@ class Command(CronCommand):
                 tool_results=tool_results,
             )
             err = scores.get("error") or ""
+            prose = scores.get("prose_faithfulness")
             AgentRunJudgement.objects.create(
                 run=run,
                 team_id=run.team_id,
                 faithfulness=float(scores.get("faithfulness", 0.0)),
                 citation_precision=float(scores.get("citation_precision", 0.0)),
                 completeness=float(scores.get("completeness", 0.0)),
+                prose_faithfulness=float(prose) if prose is not None else None,
                 notes=scores.get("notes", "") or "",
                 judge_model=judge_model,
                 error=err,
@@ -242,6 +248,9 @@ class Command(CronCommand):
             else:
                 for k in score_sums:
                     score_sums[k] += float(scores.get(k, 0.0))
+                if prose is not None:
+                    prose_sum += float(prose)
+                    prose_n += 1
 
         ok = judged - errors
         self.stdout.write(
@@ -255,12 +264,18 @@ class Command(CronCommand):
             # failed instead of green when judge calls erred.
             log.error("agent_judge_sample: %d judge error(s) out of %d judged", errors, judged)
         if ok:
+            prose_part = (
+                f"  prose={prose_sum / prose_n:.2f} (n={prose_n})"
+                if prose_n
+                else "  prose=n/a (no link-form citations)"
+            )
             self.stdout.write(
                 self.style.NOTICE(
                     f"Means over {ok} scored: "
                     f"faith={score_sums['faithfulness'] / ok:.2f}  "
                     f"cite={score_sums['citation_precision'] / ok:.2f}  "
                     f"compl={score_sums['completeness'] / ok:.2f}"
+                    + prose_part
                 )
             )
 
@@ -305,6 +320,8 @@ class Command(CronCommand):
         # Means over successful judgements only (error="") so failed judge
         # calls (scored 0.0) don't drag the trend down.
         ok = qs.filter(error="")
+        # Avg skips NULLs, so `prose` naturally means "over the runs that
+        # had link-form citations" — days where none did show as n/a.
         by_day = (
             ok.annotate(day=TruncDate("created_at"))
             .values("day")
@@ -313,6 +330,7 @@ class Command(CronCommand):
                 faith=Avg("faithfulness"),
                 cite=Avg("citation_precision"),
                 compl=Avg("completeness"),
+                prose=Avg("prose_faithfulness"),
             )
             .order_by("day")
         )
@@ -322,30 +340,41 @@ class Command(CronCommand):
             + (f", team {team_id}" if team_id else "")
             + f" ({total} judgement(s), {qs.filter(~Q(error='')).count()} errored) ==="
         )
-        self.stdout.write(f"  {'day':<12} {'n':>4}  {'faith':>6} {'cite':>6} {'compl':>6}")
+        self.stdout.write(
+            f"  {'day':<12} {'n':>4}  {'faith':>6} {'cite':>6} {'compl':>6} {'prose':>6}"
+        )
         for row in by_day:
+            prose_cell = f"{row['prose']:>6.2f}" if row["prose"] is not None else f"{'n/a':>6}"
             self.stdout.write(
                 f"  {str(row['day']):<12} {row['n']:>4}  "
-                f"{row['faith']:>6.2f} {row['cite']:>6.2f} {row['compl']:>6.2f}"
+                f"{row['faith']:>6.2f} {row['cite']:>6.2f} {row['compl']:>6.2f} {prose_cell}"
             )
 
         agg = ok.aggregate(
             faith=Avg("faithfulness"),
             cite=Avg("citation_precision"),
             compl=Avg("completeness"),
+            prose=Avg("prose_faithfulness"),
             n=Count("id"),
         )
         if agg["n"]:
+            prose_overall = f"{agg['prose']:.2f}" if agg["prose"] is not None else "n/a"
             self.stdout.write(
                 self.style.NOTICE(
                     f"\n  overall ({agg['n']} scored): "
                     f"faith={agg['faith']:.2f}  cite={agg['cite']:.2f}  compl={agg['compl']:.2f}"
+                    f"  prose={prose_overall}"
                 )
             )
 
         return self._check_drift(ok, days=days, team_id=team_id)
 
     # Axes the drift check watches, mapped to their model field.
+    # prose_faithfulness (D5) is deliberately NOT here yet: it's only
+    # populated for runs whose answers carry link-form citations, so its
+    # per-window n is a fraction of the sample and a drift verdict on it
+    # would be noise-gated. Add it once its per-window n reliably clears
+    # _DRIFT_MIN_PER_WINDOW.
     _DRIFT_AXES = (
         ("faith", "faithfulness"),
         ("cite", "citation_precision"),

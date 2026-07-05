@@ -38,3 +38,8 @@ output "deploy_service_account" {
 output "wif_provider" {
   value = google_iam_workload_identity_pool_provider.github.name
 }
+
+# Scheduled maintenance jobs (Cloud Run Jobs triggered by Cloud Scheduler).
+output "scheduled_jobs" {
+  value = { for k, j in google_cloud_scheduler_job.cron : k => "${google_cloud_run_v2_job.cron[k].name} @ ${j.schedule}" }
+}

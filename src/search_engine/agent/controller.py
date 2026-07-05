@@ -33,11 +33,14 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 from uuid import UUID
 
 from django.conf import settings
+from django.db import connections
 
+from origin.search_engine.agent import tool_cache
 from origin.search_engine.agent.abstention import ABSTAIN_MESSAGE, is_abstention
 from origin.search_engine.agent.citation_resolver import resolve_unresolved_citations
 from origin.search_engine.agent.prompts import (
@@ -53,6 +56,7 @@ from origin.search_engine.llm import (
     ToolDeclaration,
     get_model_client,
 )
+from origin.search_engine.llm.choice import _server_default_choice, get_llm_choice
 from origin.search_engine.models import AgentRun, AgentStep
 
 log = logging.getLogger(__name__)
@@ -83,17 +87,56 @@ def _persist_step(run_id: UUID | None, **fields: Any) -> AgentStep | None:
         return None
 
 
+# One-shot latch so the kill-switch state is logged once per worker
+# process (visible near startup) instead of spamming every request.
+_KILLSWITCH_LOGGED = False
+
+
+def _operator_disabled_tools() -> set[str]:
+    """Resolve the `AGENT_DISABLED_TOOLS` ops kill-switch (+ log once).
+
+    FAIL-OPEN: unset/empty disables nothing — env vars are per-service /
+    per-environment config, so a service that misses the var must run at
+    full capability rather than silently losing tools (see settings.py
+    and SPOTLIGHT_AGENT_CHANGE_SAFETY.md §4.4). Unknown names disable
+    nothing and are logged at ERROR: the operator believes something is
+    switched off that isn't — exactly a typo's failure mode.
+    """
+    global _KILLSWITCH_LOGGED
+    configured = settings.SEARCH_ENGINE.get("AGENT_DISABLED_TOOLS") or frozenset()
+    if not configured:
+        return set()
+    known = set(configured) & set(REGISTRY)
+    if not _KILLSWITCH_LOGGED:
+        _KILLSWITCH_LOGGED = True
+        log.warning(
+            "AGENT_DISABLED_TOOLS active — tools hidden from the agent: %s",
+            sorted(known),
+        )
+        unknown = set(configured) - known
+        if unknown:
+            log.error(
+                "AGENT_DISABLED_TOOLS names unknown tool(s) %s — probable "
+                "typo; they disable nothing",
+                sorted(unknown),
+            )
+    return known
+
+
 def _build_tool_declarations(
     disabled_tools: set[str] | None = None,
 ) -> list[ToolDeclaration]:
     """Translate each registered Tool into a provider-neutral declaration.
 
     Tools whose name appears in `disabled_tools` are omitted from the
-    list, so the model never even sees them as callable. Currently used
-    to honour the frontend "Web search" toggle (filters out
-    `search_web`).
+    list, so the model never even sees them as callable. Used to honour
+    the frontend "Web search" toggle (filters out `search_web`) and §4.5
+    tool subsetting; the `AGENT_DISABLED_TOOLS` ops kill-switch is
+    unioned in here — the single choke point every declaration build
+    passes through. Note this hides tools from NEW model turns; a write
+    tool already paused for approval still resumes if the user approves.
     """
-    disabled = disabled_tools or set()
+    disabled = (disabled_tools or set()) | _operator_disabled_tools()
     return [
         ToolDeclaration(
             name=t.name,
@@ -495,6 +538,21 @@ def _todo_source(item_id: Any, title: Any, local_date: Any) -> dict[str, Any]:
     return s
 
 
+def _milestone_source(
+    milestone_id: Any, title: Any, project_id: Any, task_id: Any = None
+) -> dict[str, Any]:
+    # entity_id mirrors the milestone chunker (`milestone:<id>`). The
+    # backing task_id + project_id let the frontend deep-link the chip
+    # through the task view (App.tsx handleSpotlightSelect routes a
+    # milestone the same as its backing task). task_id is None for legacy
+    # milestones whose backing task hasn't been auto-created yet.
+    s = _blank_source("milestone", f"milestone:{milestone_id}")
+    s["title"] = title or ""
+    s["project_id"] = str(project_id) if project_id is not None else None
+    s["task_id"] = str(task_id) if task_id is not None else None
+    return s
+
+
 def _ui_sources_from_tool_result(call_name: str, result: dict[str, Any]) -> list[dict[str, Any]]:
     """Build UI source dicts from a non-search read tool's result.
 
@@ -850,10 +908,20 @@ def reconstruct_sources_for_run(run) -> list[dict[str, Any]]:
 # Phase 4.2 — source-chip ranking by citation density                         #
 # --------------------------------------------------------------------------- #
 
-# Matches the same `[entity_id]` shape used in the agent's prompt and the
-# frontend citation rewriter — keep this in sync with `_CITATION_RE` in
-# evals/runner.py and the regex in SpotlightOverlay's rewriteCitations.
-_INLINE_CITATION_RE = re.compile(r"\[([a-z][a-z0-9_:\-]+)\]")
+# Matches BOTH citation forms the agent emits (§4.6 D5): the natural-prose
+# link `[prose](type:id)` (id captured in group 1) and the bare `[type:id]`
+# fallback (id in group 2). The link alternative is FIRST and consumes the
+# whole `[label](id)` so a single-word label (`[spike](task:42)`) yields the
+# id, not the label. Keep in sync with the frontend rewriter (citationUtils.ts
+# CITATION_PATTERN / CITATION_LINK_PATTERN) and `_CITATION_RE` in
+# evals/runner.py.
+_INLINE_CITATION_RE = re.compile(r"\[[^\]]*\]\(([a-z][a-z0-9_:\-]+)\)|\[([a-z][a-z0-9_:\-]+)\]")
+
+
+def _iter_cited_ids(text: str):
+    """Yield the entity-id token from every citation (either form) in `text`."""
+    for m in _INLINE_CITATION_RE.finditer(text or ""):
+        yield (m.group(1) or m.group(2))
 
 
 def _rank_sources_by_citation(
@@ -876,7 +944,7 @@ def _rank_sources_by_citation(
     if not sources:
         return sources
 
-    cited_tokens = {m.lower() for m in _INLINE_CITATION_RE.findall(answer_text or "")}
+    cited_tokens = {tok.lower() for tok in _iter_cited_ids(answer_text)}
     if not cited_tokens:
         return sources
 
@@ -913,6 +981,7 @@ def run_agent(
     system_extra: str | None = None,
     seed_sources: list[dict[str, Any]] | None = None,
     trace_hook: Callable[[str, dict[str, Any], dict[str, Any]], None] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Drive the agent loop from a fresh user query.
 
@@ -1009,6 +1078,7 @@ def run_agent(
                 disabled_tools=disabled_tools,
                 system_extra=system_extra,
                 trace_hook=trace_fn,
+                session_id=session_id,
             )
         return _drive_loop(
             messages=messages,
@@ -1020,6 +1090,7 @@ def run_agent(
             disabled_tools=disabled_tools,
             system_extra=system_extra,
             trace_hook=trace_fn,
+            session_id=session_id,
         )
 
     # §4.1 abstention gate — only on a fresh workspace query. With
@@ -1184,6 +1255,11 @@ def resume_agent(
                         "summary": summary,
                     }
                 )
+                # C3: an APPROVED write just changed the workspace, so
+                # every cached read this session made before it is now
+                # suspect — drop them all (generation bump, O(1)).
+                if run.session_id:
+                    tool_cache.invalidate_session(str(run.session_id))
                 try:
                     pending_step.summary = summary
                     pending_step.result_json = result
@@ -1205,12 +1281,139 @@ def resume_agent(
         run_id=run.run_id,
         starting_step=step_index + 1,
         seen_sources_by_id={},  # `sources` events were sent in the original stream; don't double-emit.
+        session_id=str(run.session_id) if run.session_id else None,
     )
 
 
 # --------------------------------------------------------------------------- #
 # Shared loop body                                                            #
 # --------------------------------------------------------------------------- #
+
+
+def _run_tool_guarded(tool: Any, call_name: str, call_args: dict[str, Any], ctx: ToolContext) -> tuple[str, Any]:
+    """Execute one read-only tool, never raising.
+
+    Returns a tagged outcome consumed by the loop's apply phase:
+      ("ok", result_dict) | ("tool_error", message) | ("crash", message)
+    The tag split preserves today's two error flavors exactly: a
+    ToolError's message is user-facing (ACL denials, bad args), a crash
+    gets the generic internal-error string + a server-side traceback.
+    Shared by the serial path and the E1 parallel executor, so error
+    semantics can't diverge between them.
+    """
+    try:
+        return ("ok", tool.run(call_args, ctx))
+    except ToolError as e:
+        return ("tool_error", str(e))
+    except Exception:  # noqa: BLE001
+        log.exception("Tool %s crashed on args %r", call_name, call_args)
+        return ("crash", f"Internal error in tool '{call_name}'.")
+
+
+def _execute_batch_parallel(
+    calls: list[FunctionCall], ctx: ToolContext
+) -> list[tuple[str, Any]]:
+    """E1 — run a batch of read-only tool calls concurrently.
+
+    Returns outcomes IN CALL ORDER (pool.map preserves it), so the
+    caller's emit/persist/messages sequence stays byte-deterministic
+    regardless of completion order — `AgentStep` rows and the message
+    transcript must not depend on thread scheduling (resume rebuilds
+    from them). Wall-clock is bounded by the slowest call either way.
+
+    Each worker closes its Django DB connections in `finally`:
+    short-lived executor threads would otherwise leak a connection per
+    call (`close_old_connections` is for long-lived threads; these die
+    with the batch). All DB WRITES (_persist_step) happen on the
+    controller thread after the join — no write concurrency here.
+    """
+    max_workers = min(
+        len(calls), int(settings.SEARCH_ENGINE.get("RAG_PARALLEL_TOOLS_MAX_WORKERS", 4))
+    )
+
+    def _task(call: FunctionCall) -> tuple[str, Any]:
+        try:
+            return _run_tool_guarded(REGISTRY.get(call.name), call.name, dict(call.args), ctx)
+        finally:
+            try:
+                connections.close_all()
+            except Exception:  # noqa: BLE001 — cleanup must not eat the outcome
+                log.exception("close_all failed in parallel tool worker")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(_task, calls))
+def _resolve_planning_override() -> str | None:
+    """B3 provider tier split (SPOTLIGHT_FUTURE_ARCHITECTURE.md §3).
+
+    Returns the model id to run the loop's PLANNING steps on (passed as
+    `model_override`, which beats the user's `LlmChoice`), or None when
+    the split is inactive and every step runs on one model exactly as
+    before. The final SYNTHESIS step always uses the user's model — see
+    the discard-and-rerun logic in `_drive_loop`.
+
+    Skips (returning None) when:
+      * `RAG_PLANNING_MODEL` is empty — feature off, zero code-path change;
+      * the planning model IS the effective synthesis model (user picked
+        the fast model, or the server default already is it) — the split
+        would buy nothing but the buffering machinery;
+      * the planning model's provider doesn't match the active provider.
+        This guard is PREVENTIVE, unlike the reranker's try/except
+        fallback: a mid-loop model error kills the run, so we must never
+        hand `ClaudeClient` a `gemini-*` id (or vice versa).
+    """
+    planning = (settings.SEARCH_ENGINE.get("RAG_PLANNING_MODEL") or "").strip()
+    if not planning:
+        return None
+    choice = get_llm_choice() or _server_default_choice()
+    synthesis_model = (choice.model or "").strip()
+    if not synthesis_model or planning == synthesis_model:
+        return None
+    provider_prefix = "claude" if choice.provider == "claude" else "gemini"
+    if not planning.startswith(provider_prefix):
+        log.warning(
+            "RAG_PLANNING_MODEL=%r does not match the active provider %r; "
+            "planning split disabled for this run",
+            planning,
+            choice.provider,
+        )
+        return None
+    return planning
+
+
+def _collect_step(
+    client: Any,
+    *,
+    messages: list[AgentMessage],
+    tools: list[ToolDeclaration],
+    system_instruction: str,
+    emit: Callable[[dict[str, Any]], None],
+    model_override: str | None = None,
+    emit_deltas: bool = True,
+) -> tuple[list[str], list[FunctionCall]]:
+    """Run ONE model turn and collect `(text_parts, function_calls)`.
+
+    `emit_deltas=False` buffers text instead of streaming it — the B3
+    planning pass uses this because a text-only planning response is a
+    DRAFT that will be discarded and re-generated on the user's model;
+    streaming it would show the user an answer that then gets replaced.
+    Exceptions propagate to the caller (the loop owns error handling).
+    """
+    text_parts: list[str] = []
+    calls: list[FunctionCall] = []
+    stream = client.generate_step(
+        messages=messages,
+        tools=tools,
+        system_instruction=system_instruction,
+        model_override=model_override,
+    )
+    for text_chunk, function_call in stream:
+        if function_call is not None:
+            calls.append(function_call)
+        elif text_chunk:
+            text_parts.append(text_chunk)
+            if emit_deltas:
+                emit({"type": "answer_delta", "text": text_chunk})
+    return text_parts, calls
 
 
 def _drive_loop(
@@ -1225,6 +1428,7 @@ def _drive_loop(
     system_extra: str | None = None,
     trace_hook: Callable[[str, dict[str, Any], dict[str, Any]], None] | None = None,
     max_steps: int | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any] | None:
     """The core agent loop, shared by `run_agent` and `resume_agent`.
 
@@ -1240,31 +1444,71 @@ def _drive_loop(
     this call. The critique-with-retrieval continuation passes a tight
     budget (`starting_step + RAG_CRITIQUE_MAX_STEPS`) so the critique can
     fire at most one more retrieval before answering.
+
+    `session_id`, when set, keys the C3 session tool-result cache — a
+    follow-up turn re-calling the same read-only tool with identical
+    args reuses the stored result. None (evals, tests, sessionless
+    callers) bypasses the cache entirely.
     """
     if max_steps is None:
         max_steps = int(settings.SEARCH_ENGINE.get("AGENT_MAX_STEPS", 5))
     client = get_model_client()
+    # B3 — planning-model split. When active, loop steps run on the fast
+    # planning model and only the final synthesis is written by the
+    # user's model, via discard-and-rerun below. None = single-model
+    # behavior, byte-identical to the pre-B3 loop.
+    planning_model = _resolve_planning_override()
     tools = _build_tool_declarations(disabled_tools)
     system_instruction = AGENT_SYSTEM_PROMPT
     if system_extra:
         system_instruction = f"{AGENT_SYSTEM_PROMPT}\n\n{system_extra}"
 
     for step in range(starting_step, max_steps):
-        accumulated_function_calls: list[FunctionCall] = []
-        accumulated_text_parts: list[str] = []
-
         try:
-            stream = client.generate_step(
-                messages=messages,
-                tools=tools,
-                system_instruction=system_instruction,
-            )
-            for text_chunk, function_call in stream:
-                if function_call is not None:
-                    accumulated_function_calls.append(function_call)
-                elif text_chunk:
-                    accumulated_text_parts.append(text_chunk)
-                    emit({"type": "answer_delta", "text": text_chunk})
+            if planning_model is None:
+                accumulated_text_parts, accumulated_function_calls = _collect_step(
+                    client,
+                    messages=messages,
+                    tools=tools,
+                    system_instruction=system_instruction,
+                    emit=emit,
+                )
+            else:
+                # Planning pass on the fast model, deltas BUFFERED — a
+                # step is only known to be planning vs synthesis after
+                # the model responds, and a synthesis draft from the
+                # fast model must never reach the user.
+                accumulated_text_parts, accumulated_function_calls = _collect_step(
+                    client,
+                    messages=messages,
+                    tools=tools,
+                    system_instruction=system_instruction,
+                    emit=emit,
+                    model_override=planning_model,
+                    emit_deltas=False,
+                )
+                if accumulated_function_calls:
+                    # Planning step confirmed — flush the buffered
+                    # thinking-out-loud text now (same events, batched).
+                    for chunk in accumulated_text_parts:
+                        emit({"type": "answer_delta", "text": chunk})
+                else:
+                    # The fast model judged the loop ready to answer.
+                    # DISCARD its draft and re-run this one step with no
+                    # override (= the user's model), streaming live. Net
+                    # cost vs single-model: the same one smart call plus
+                    # N cheap planning calls and one wasted draft; net
+                    # win: every planning round-trip at fast-model
+                    # latency. If the smart model instead decides to dig
+                    # further (it's the better judge), its calls flow
+                    # into normal tool execution below.
+                    accumulated_text_parts, accumulated_function_calls = _collect_step(
+                        client,
+                        messages=messages,
+                        tools=tools,
+                        system_instruction=system_instruction,
+                        emit=emit,
+                    )
         except Exception as e:  # noqa: BLE001 — surface as stream error
             log.exception("Agent step %d LLM call failed", step)
             emit({"type": "error", "message": f"LLM call failed: {e}"})
@@ -1316,6 +1560,12 @@ def _drive_loop(
                 build_note_source=lambda note_type, note_id, title, parent_context: _note_source(
                     note_type, note_id, title, parent_context
                 ),
+                build_todo_source=lambda item_id, title, local_date: _todo_source(
+                    item_id, title, local_date
+                ),
+                build_milestone_source=lambda milestone_id, title, project_id, task_id: (
+                    _milestone_source(milestone_id, title, project_id, task_id)
+                ),
             )
             if late_sources:
                 _apply_friendly_titles(late_sources, ctx)
@@ -1346,7 +1596,62 @@ def _drive_loop(
             emit({"type": "done"})
             return None
 
-        for call in accumulated_function_calls:
+        # ---- C3: resolve session-cache hits before any execution ----
+        # A follow-up turn re-calling the same read-only tool with the
+        # same args inside the session TTL gets the stored result — no
+        # tool round-trip. Hits are injected as pre-resolved "ok"
+        # outcomes (summary re-attached so the shared pop below works);
+        # write/unknown tools are never consulted.
+        precomputed: dict[int, tuple[str, Any]] = {}
+        cached_indices: set[int] = set()
+        if session_id and tool_cache.enabled():
+            for i, c in enumerate(accumulated_function_calls):
+                t = REGISTRY.get(c.name)
+                if t is None or getattr(t, "requires_approval", False):
+                    continue
+                hit = tool_cache.get_cached(session_id, c.name, dict(c.args))
+                if hit is not None:
+                    precomputed[i] = ("ok", {**hit["result"], "__summary__": hit["summary"]})
+                    cached_indices.add(i)
+
+        # ---- E1: parallel dispatch for read-only batches (flag-gated) ----
+        # Only when the WHOLE batch is known, read-only tools and there
+        # is actual parallelism to win among the cache MISSES (>1). Any
+        # unknown tool or `requires_approval` write keeps the serial
+        # path byte-for-byte — the approval pause returns mid-batch and
+        # drops the remaining calls, and "parallel + mid-stream pause"
+        # is incoherent. All `tool_call_start` events go out first in
+        # call order; outcomes come back in call order too (see
+        # _execute_batch_parallel), so the emit/persist/messages
+        # sequence below is unchanged.
+        starts_pre_emitted = False
+        miss_indices = [
+            i for i in range(len(accumulated_function_calls)) if i not in precomputed
+        ]
+        if (
+            settings.SEARCH_ENGINE.get("RAG_PARALLEL_TOOLS", False)
+            and len(miss_indices) > 1
+            and all(
+                REGISTRY.get(c.name) is not None
+                and not getattr(REGISTRY.get(c.name), "requires_approval", False)
+                for c in accumulated_function_calls
+            )
+        ):
+            for call in accumulated_function_calls:
+                emit(
+                    {
+                        "type": "tool_call_start",
+                        "step": step,
+                        "tool_name": call.name,
+                        "arguments": _friendly_arguments(dict(call.args)),
+                    }
+                )
+            starts_pre_emitted = True
+            miss_calls = [accumulated_function_calls[i] for i in miss_indices]
+            for i, outcome in zip(miss_indices, _execute_batch_parallel(miss_calls, ctx)):
+                precomputed[i] = outcome
+
+        for call_idx, call in enumerate(accumulated_function_calls):
             call_args = dict(call.args)
             call_name = call.name
 
@@ -1414,46 +1719,30 @@ def _drive_loop(
                     "arguments": call_args,
                 }
 
-            # ---- Read-only tool: run it inline ----
-            emit(
-                {
-                    "type": "tool_call_start",
-                    "step": step,
-                    "tool_name": call_name,
-                    "arguments": _friendly_arguments(call_args),
-                }
-            )
-
-            try:
-                result = tool.run(call_args, ctx)
-            except ToolError as e:
+            # ---- Read-only tool ----
+            # Serial path: emit start + resolve inline (cache hit or
+            # run). Parallel path: starts were already emitted (call
+            # order) and the outcome sits in `precomputed` — everything
+            # from here down is identical for both, so E1/C3 cannot
+            # change events, AgentStep rows, or the message transcript,
+            # only whether/when `tool.run` executed.
+            if not starts_pre_emitted:
                 emit(
                     {
-                        "type": "tool_call_error",
+                        "type": "tool_call_start",
                         "step": step,
                         "tool_name": call_name,
-                        "error": str(e),
+                        "arguments": _friendly_arguments(call_args),
                     }
                 )
-                _persist_step(
-                    run_id,
-                    step_index=step,
-                    tool_name=call_name,
-                    arguments_json=call_args,
-                    thought_signature=call.thought_signature,
-                    error=str(e),
-                )
-                if trace_hook is not None:
-                    try:
-                        trace_hook(call_name, call_args, {"error": str(e)})
-                    except Exception:  # noqa: BLE001
-                        log.exception("trace_hook failed for tool %s (error path)", call_name)
-                messages.append(_assistant_function_call_turn(call))
-                messages.append(_function_response_turn(call_name, {"error": str(e)}))
-                continue
-            except Exception as e:  # noqa: BLE001
-                log.exception("Tool %s crashed on args %r", call_name, call_args)
-                err = f"Internal error in tool '{call_name}'."
+            if call_idx in precomputed:
+                kind, payload = precomputed[call_idx]
+            else:
+                kind, payload = _run_tool_guarded(tool, call_name, call_args, ctx)
+            from_cache = call_idx in cached_indices
+
+            if kind != "ok":
+                err = str(payload)
                 emit(
                     {
                         "type": "tool_call_error",
@@ -1474,20 +1763,29 @@ def _drive_loop(
                     try:
                         trace_hook(call_name, call_args, {"error": err})
                     except Exception:  # noqa: BLE001
-                        log.exception("trace_hook failed for tool %s (crash path)", call_name)
+                        log.exception("trace_hook failed for tool %s (error path)", call_name)
                 messages.append(_assistant_function_call_turn(call))
                 messages.append(_function_response_turn(call_name, {"error": err}))
                 continue
 
+            result = payload
             summary = result.pop("__summary__", "ok")
-            emit(
-                {
-                    "type": "tool_call_result",
-                    "step": step,
-                    "tool_name": call_name,
-                    "summary": summary,
-                }
-            )
+            result_event = {
+                "type": "tool_call_result",
+                "step": step,
+                "tool_name": call_name,
+                "summary": summary,
+            }
+            if from_cache:
+                # Observability marker only — the frontend destructures
+                # step/tool_name/summary and ignores unknown fields.
+                result_event["cached"] = True
+            emit(result_event)
+            # C3: cache the fresh result for follow-up turns in this
+            # session. Cached hits are NOT re-stored (their TTL should
+            # date from the original execution, not the last reuse).
+            if not from_cache:
+                tool_cache.store(session_id, call_name, call_args, summary, result)
             _persist_step(
                 run_id,
                 step_index=step,
@@ -1583,6 +1881,7 @@ def _drive_loop_with_critique(
     disabled_tools: set[str] | None = None,
     system_extra: str | None = None,
     trace_hook: Callable[[str, dict[str, Any], dict[str, Any]], None] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Run `_drive_loop` with captured events, then optionally rewrite
     the draft answer via a single self-critique LLM call.
@@ -1632,6 +1931,7 @@ def _drive_loop_with_critique(
         disabled_tools=disabled_tools,
         system_extra=system_extra,
         trace_hook=_capture_trace,
+        session_id=session_id,
     )
 
     if pause_descriptor is not None:
@@ -1666,6 +1966,7 @@ def _drive_loop_with_critique(
             disabled_tools=disabled_tools,
             system_extra=system_extra,
             trace_hook=trace_hook,
+            session_id=session_id,
         ):
             emit(e)
         return None
@@ -1758,6 +2059,7 @@ def _critique_with_retrieval(
     disabled_tools: set[str] | None,
     system_extra: str | None,
     trace_hook: Callable[[str, dict[str, Any], dict[str, Any]], None] | None,
+    session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Retrieval-capable critique: re-enter `_drive_loop` for a short,
     read-only continuation so the model can fix a *completeness* gap with
@@ -1805,6 +2107,7 @@ def _critique_with_retrieval(
             system_extra=system_extra,
             trace_hook=trace_hook,
             max_steps=next_step + crit_steps,
+            session_id=session_id,
         )
     except Exception:  # noqa: BLE001 — never lose the draft on a critique fault
         log.exception("Critique-with-retrieval continuation failed; keeping draft")

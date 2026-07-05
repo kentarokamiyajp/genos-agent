@@ -653,19 +653,22 @@
     must_not_contain_title: ["stakeholder map"]
 
 # ============================================================ #
-# K. Graph-native relational recall (Q2.4 / GraphRAG TARGET)   #
+# K. Graph-native relational recall (Q2.4 / GraphRAG)          #
 # ============================================================ #
 # The framer-motion spike BLOCKS the Hero build (seeded TaskDependency),
-# but the Hero task's TEXT need not mention framer-motion — so today's
-# BM25 + vector retrieval cannot connect them. This case asserts the
-# blocked task surfaces for a relational query. It is EXPECTED TO FAIL on
-# the current pipeline (no graph fusion at ranking time) and is the
-# measurable target GraphRAG (A1, §4.3) would turn green — i.e. a red
-# baseline here quantifies the GraphRAG gap. (The reactive get_task_blockers
-# path already covers this relation; see the graph_* behavior cases.)
+# but the Hero task's TEXT need not mention framer-motion — so raw
+# BM25 + vector retrieval cannot connect them. Graph ranking fusion
+# (`_graph_expand`, Q2.4) closed this gap: the one-hop TaskDependency
+# walk injects the blocked task at ranking time, and this case is its
+# REGRESSION GUARD (green since Q2.4; it was the red target baseline
+# before that). `overlays: true` because the case exists to measure the
+# graph overlay — eval mode is otherwise raw (no reranker, no graph).
+# (The reactive get_task_blockers path covers the same relation; see
+# the graph_* behavior cases.)
 
 - id: graph_native_blocked_by_framer_spike
   fixture: true
+  overlays: true
   query: "Which tasks are blocked by the framer-motion spike decision?"
   expect:
     must_contain_title_in_top_n:
@@ -749,3 +752,42 @@
     must_contain_title_in_top_n:
       n: 5
       title_substrings: ["المقهى"]
+
+# A1-ext — multi-hop traversal regression guard. The seeded chain is
+# framer-motion spike → (blocks) Build Hero + FeatureGrid → (blocks)
+# Accessibility audit — 2 hops, so this case is red at
+# RAG_GRAPH_MAX_HOPS=1 (measured: recall 0.0) and green at the default
+# 2 (recall 1.0; the A/B that justified the default). overlays: true —
+# it exists to measure the graph overlay.
+
+- id: graph_native_2hop_downstream_of_framer_spike
+  fixture: true
+  overlays: true
+  query: "What work is downstream of the framer-motion spike decision?"
+  expect:
+    must_contain_title_in_top_n:
+      n: 8
+      title_substrings: ["Accessibility audit"]
+
+# A1-ext — vector-only relational entry target (EXPECTED TO FAIL; the
+# documented gap). A Japanese query about the animation-library decision
+# hits the English spike task at VECTOR RANK 1 with zero keyword overlap
+# (kw=None — verified on the fixture), so the keyword-anchor gate
+# refuses to seed expansion and the blocked Hero build never surfaces.
+# The shipped RAG_GRAPH_VECTOR_FLOOR cannot safely fix this: RRF
+# flattens similarity to rank, and measured gibberish noise at vector
+# rank 1 scores IDENTICALLY (0.0328) to this genuine hit — so any floor
+# that admits this case admits gibberish too (and would regress
+# gibberish_returns_few_or_nothing). Turning this green requires
+# plumbing raw kNN cosine similarity through fusion so signal and noise
+# separate. Until then this case quantifies the gap, exactly like the
+# original graph_native case did for one-hop fusion.
+
+- id: graph_native_crosslingual_vector_entry
+  fixture: true
+  overlays: true
+  query: "アニメーションライブラリの選定に依存しているタスクは？"
+  expect:
+    must_contain_title_in_top_n:
+      n: 8
+      title_substrings: ["Hero + FeatureGrid"]
