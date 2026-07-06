@@ -43,8 +43,13 @@ variable "embedding_provider" {
 
 # --- Cloud SQL (Postgres) ------------------------------------------------- #
 variable "db_tier" {
-  type    = string
-  default = "db-custom-1-3840" # 1 vCPU / 3.75GB — demo-grade
+  type = string
+  # Shared-core, ~1.7GB — right-sized for the parallel demo env (10-20 light
+  # users, low activity). Cloud SQL ENTERPRISE edition (not Plus) supports
+  # shared-core tiers. Was db-custom-1-3840 (dedicated 1 vCPU / 3.75GB);
+  # downsized 2026-07-07 for cost — bump back if this env takes real sustained
+  # load.
+  default = "db-g1-small"
 }
 
 variable "db_version" {
@@ -74,8 +79,12 @@ variable "redis_memory_gb" {
 
 # --- OpenSearch (single-node on a GCE COS VM) ----------------------------- #
 variable "opensearch_machine_type" {
-  type    = string
-  default = "e2-standard-2" # 2 vCPU / 8GB — OpenSearch heap is 1g (see below)
+  type = string
+  # 2 vCPU / 4GB — the OpenSearch JVM heap is only 1g, so 4GB comfortably fits
+  # heap + off-heap + COS. Was e2-standard-2 (8GB); downsized 2026-07-07 for
+  # cost (the parallel demo env sees light traffic). Bump back to e2-standard-2
+  # if indexing/query load grows.
+  default = "e2-medium"
 }
 
 variable "opensearch_data_disk_gb" {

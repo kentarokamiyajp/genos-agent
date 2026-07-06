@@ -18,16 +18,11 @@ resource "google_compute_subnetwork" "subnet" {
   private_ip_google_access = true
 }
 
-# Serverless VPC Access connector — Cloud Run egress into the VPC.
-resource "google_vpc_access_connector" "connector" {
-  name          = "genos-connector"
-  region        = var.region
-  network       = google_compute_network.vpc.name
-  ip_cidr_range = "10.8.0.0/28" # dedicated /28, must not overlap the subnet
-  min_instances = 2
-  max_instances = 3
-  depends_on    = [google_project_service.enabled]
-}
+# Cloud Run reaches the VPC via Direct VPC egress (each service/job pins
+# network_interfaces.subnetwork = genos-subnet), so no Serverless VPC Access
+# connector is needed. The connector (2 always-on e2-micro instances, the
+# 10.8.0.0/28 range) was removed 2026-07-07 for cost after verifying Direct
+# egress reaches the PSA-peered Cloud SQL/Redis and the subnet-local OpenSearch.
 
 # --- Private Service Access: reserved range peered to Google's managed VPC,
 # so Cloud SQL and Memorystore get private IPs reachable from our VPC. -------
@@ -56,8 +51,10 @@ resource "google_compute_firewall" "allow_opensearch_from_connector" {
     protocol = "tcp"
     ports    = ["9200"]
   }
-  # Connector range + subnet (in case future in-VPC clients need it).
-  source_ranges = ["10.8.0.0/28", "10.10.0.0/24"]
+  # Subnet range — Direct VPC egress instances draw their IPs from genos-subnet,
+  # so this covers Cloud Run's access to OpenSearch:9200. (The old connector
+  # /28 was dropped with the connector on 2026-07-07.)
+  source_ranges = ["10.10.0.0/24"]
   target_tags   = ["opensearch"]
 }
 

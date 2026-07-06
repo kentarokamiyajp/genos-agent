@@ -6,13 +6,6 @@ locals {
 
   # Django ALLOWED_HOSTS: wildcard any *.run.app + the api custom domain.
   allowed_hosts = join(",", compact([".run.app", var.domains.api]))
-
-  # Things every service's revision should wait on.
-  run_deps = [
-    google_secret_manager_secret_version.managed,
-    google_project_iam_member.run,
-    google_vpc_access_connector.connector,
-  ]
 }
 
 # --------------------------------------------------------------------------- #
@@ -27,9 +20,14 @@ resource "google_cloud_run_v2_service" "api" {
   template {
     service_account = google_service_account.run.email
 
+    # Direct VPC egress (no connector) — see the collab service for the full
+    # rationale. Reaches Cloud SQL / Memorystore (PSA peering) + OpenSearch
+    # (subnet) directly; public egress stays default. Migrated 2026-07-07.
     vpc_access {
-      connector = google_vpc_access_connector.connector.id
-      egress    = "PRIVATE_RANGES_ONLY" # public egress stays default; private IPs via connector
+      network_interfaces {
+        subnetwork = google_compute_subnetwork.subnet.id
+      }
+      egress = "PRIVATE_RANGES_ONLY"
     }
 
     scaling {
@@ -41,7 +39,11 @@ resource "google_cloud_run_v2_service" "api" {
       image = var.images.api
 
       resources {
-        limits            = { cpu = "2", memory = "2Gi" }
+        # 1 vCPU / 1GB — right-sized for the parallel demo env's light traffic
+        # (was 2/2Gi; downsized 2026-07-07 for cost). Kept warm via min=1 below
+        # because the serving CMD runs migrate+collectstatic on cold start; the
+        # startup CPU boost still gives full CPU for that boot burst.
+        limits            = { cpu = "1", memory = "1Gi" }
         startup_cpu_boost = true # full CPU during the migrate/collectstatic boot burst
       }
 
@@ -404,13 +406,24 @@ resource "google_cloud_run_v2_service" "collab" {
   template {
     service_account = google_service_account.run.email
 
+    # Direct VPC egress (no Serverless VPC Access connector). The Cloud Run
+    # instance draws an IP from genos-subnet directly, reaching Cloud SQL /
+    # Memorystore over the VPC's PSA peering and OpenSearch on the subnet — the
+    # same private targets the connector served, minus its 2 always-on e2-micro
+    # instances. Migrated 2026-07-07 for cost.
     vpc_access {
-      connector = google_vpc_access_connector.connector.id
-      egress    = "PRIVATE_RANGES_ONLY" # reach Cloud SQL private IP
+      network_interfaces {
+        subnetwork = google_compute_subnetwork.subnet.id
+      }
+      egress = "PRIVATE_RANGES_ONLY"
     }
 
+    # Scale to zero: collab (Hocuspocus/Yjs note editing) tolerates a cold
+    # start cleanly — the first note-open after an idle period pays it, which
+    # is fine for the parallel demo env. Was min=1; changed 2026-07-07 for cost
+    # (an always-on instance for occasional note editing is the clearest waste).
     scaling {
-      min_instance_count = 1
+      min_instance_count = 0
       max_instance_count = 3
     }
     timeout = "3600s"

@@ -44,14 +44,18 @@ locals {
   cron_jobs = {
     reindexer = {
       job_name = "genos-reindexer"
-      schedule = "*/10 * * * *" # every 10 min — incremental OpenSearch reindex
+      # Hourly (was */10; slowed 2026-07-07 for cost — light-traffic demo env,
+      # search staleness up to ~1h is acceptable). --since-minutes MUST exceed
+      # the schedule gap so no changes fall between ticks: 61 = 60-min gap +
+      # 1-min overlap. Keep the two in lockstep if you retune the cadence.
+      schedule = "0 * * * *"
       # Mirror the Railway reindexer entrypoint (minus the Railway SA-key decode
       # — GCP authenticates to Vertex via ADC): make sure the index + mapping
       # exist (opensearch_setup is a near-no-op when the index already exists;
       # it only recreates the mapping / clears stale RagChunk on a *fresh*
-      # index) THEN push the last ~11 min of changes (1-min overlap covers the
+      # index) THEN push the last ~61 min of changes (1-min overlap covers the
       # gap between ticks).
-      command          = ["sh", "-c", "python manage.py opensearch_setup && python manage.py opensearch_reindex --since-minutes 11"]
+      command          = ["sh", "-c", "python manage.py opensearch_setup && python manage.py opensearch_reindex --since-minutes 61"]
       extra_secret_env = {}
     }
     demo_cleanup = {
@@ -63,8 +67,13 @@ locals {
       extra_secret_env = { REDIS_URL = "genos-redis-url" }
     }
     judge_sampler = {
-      job_name         = "genos-judge-sampler"
-      schedule         = "0 * * * *" # hourly — sample + LLM-judge recent AgentRuns, off the request path
+      job_name = "genos-judge-sampler"
+      # Daily 04:00 UTC (was hourly; changed 2026-07-07 for cost). This job makes
+      # Gemini LLM-judge calls (the Model Garden spend), so hourly = 24×/day of
+      # background inference independent of user activity. Daily quality sampling
+      # is plenty for a light-traffic demo env. 04:00 avoids stacking with
+      # demo_cleanup at 03:00.
+      schedule         = "0 4 * * *"
       command          = ["python", "manage.py", "agent_judge_sample"]
       extra_secret_env = {}
     }
@@ -85,9 +94,13 @@ resource "google_cloud_run_v2_job" "cron" {
       max_retries     = 0 # match Railway restartPolicyType=NEVER; the next tick is the retry
       timeout         = "900s"
 
+      # Direct VPC egress (no connector) — reaches Cloud SQL / Redis (PSA) +
+      # OpenSearch (subnet) directly. Matches the api/collab services.
       vpc_access {
-        connector = google_vpc_access_connector.connector.id
-        egress    = "PRIVATE_RANGES_ONLY" # reach Cloud SQL / Redis / OpenSearch private IPs
+        network_interfaces {
+          subnetwork = google_compute_subnetwork.subnet.id
+        }
+        egress = "PRIVATE_RANGES_ONLY"
       }
 
       containers {
