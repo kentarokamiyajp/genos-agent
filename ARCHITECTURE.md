@@ -1,7 +1,7 @@
 # システムアーキテクチャ / Architecture
 
 Genos の全体構成（インフラ・API・フロントエンド）と、このプロジェクトで加えた DevOps ループの説明です。
-**Live:** https://gcp.genosai.dev ・ **Demo:** `demo@genosai.dev` / `GenosDemo2026!`
+**Live:** https://gcp.genosai.dev
 
 ---
 
