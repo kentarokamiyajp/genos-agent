@@ -161,10 +161,17 @@ jobs:
         # suite on every PR. Trend the full behavior suite on a schedule instead.
         run: pipenv run python manage.py agent_eval --case simple_rag_wip_tasks --judge
 
+  # COST SWITCH: the eval gate (agent-evals job above) ALWAYS runs — it's the
+  # quality gate, independent of deploy target. This deploy step ships to GCP
+  # only when the repo/org variable DEPLOY_TO_GCP is "true". Unset (the default)
+  # = OFF → Railway-only, no GCP deploy. NOTE: this only stops shipping new
+  # revisions — it does NOT reduce the running GCP bill (Cloud SQL / OpenSearch
+  # VM / Redis / warm Cloud Run keep billing). To cut cost, pause or tear down
+  # the infra (see genos-docs operations/ENVIRONMENTS.md "Going Railway-only").
   deploy:
     name: deploy to Cloud Run (gated on evals)
     needs: agent-evals
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DEPLOY_TO_GCP == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -184,8 +191,72 @@ jobs:
             -t "$AR/api:${GITHUB_SHA}" -t "$AR/api:latest" .
           docker push "$AR/api:${GITHUB_SHA}"
           docker push "$AR/api:latest"
+      - name: Record previous revision (rollback target)
+        id: prev
+        run: |
+          PREV=$(gcloud run services describe genos-api \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --format 'value(status.latestReadyRevisionName)' 2>/dev/null || true)
+          echo "rev=$PREV" >> "$GITHUB_OUTPUT"
+          echo "previous ready revision: ${PREV:-<none — first deploy>}"
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy genos-api \
             --project "$GCP_PROJECT" --region "$GCP_REGION" \
             --image "$AR/api:${GITHUB_SHA}"
+          # Self-heal: if a previous run auto-reverted, traffic is pinned
+          # to an old revision and `gcloud run deploy` alone would NOT
+          # move it. Explicitly route back to latest on every deploy.
+          gcloud run services update-traffic genos-api \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --to-latest --quiet
+
+      # Cloud Run's health check only proves the process BOOTED. This
+      # proves the agent path answers a real query on the new revision
+      # (SPOTLIGHT_AGENT_CHANGE_SAFETY.md §5.3, genos-docs): provision a
+      # throwaway demo user (public-by-design endpoint, self-cleaning —
+      # signout deletes it and the daily cron sweeps leftovers), stream
+      # one /agent/ask/, and require a terminal `done` (or
+      # `tool_call_pending_approval`) NDJSON event. One retry absorbs
+      # transient LLM/network hiccups so a flake doesn't flip traffic.
+      - name: Post-deploy smoke — one real agent query on the live revision
+        id: smoke
+        run: |
+          set -uo pipefail
+          URL=$(gcloud run services describe genos-api \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --format 'value(status.url)')
+          echo "service URL: $URL"
+          smoke() {
+            rm -f cookies.txt ask.ndjson demo.json
+            curl -sSf -X POST "$URL/api/v2/user/demo/" \
+              -H 'Content-Type: application/json' -d '{}' \
+              -c cookies.txt -o demo.json || return 1
+            ACCESS=$(python3 -c 'import json;print(json.load(open("demo.json"))["access"])') || return 1
+            TEAM=$(python3 -c 'import json;print(json.load(open("demo.json"))["team_id"])') || return 1
+            curl -sS -N --max-time 180 -X POST "$URL/api/v2/agent/ask/" \
+              -H "Authorization: Bearer $ACCESS" -H 'Content-Type: application/json' \
+              -d "{\"query\": \"What tasks are currently in progress?\", \"team_id\": \"$TEAM\"}" \
+              -o ask.ndjson || true
+            # Best-effort demo cleanup — signout deletes demo accounts;
+            # the daily cron sweeps anything this misses.
+            curl -sS -X POST "$URL/api/v2/user/signout/" \
+              -b cookies.txt -H "Authorization: Bearer $ACCESS" >/dev/null || true
+            grep -qE '"type":\s*"(done|tool_call_pending_approval)"' ask.ndjson
+          }
+          if smoke; then echo "smoke PASS — terminal agent event received"; exit 0; fi
+          echo "first attempt failed — retrying once"
+          sleep 10
+          if smoke; then echo "smoke PASS on retry"; exit 0; fi
+          echo "::error::post-deploy smoke FAILED — /api/v2/agent/ask/ produced no terminal event on the new revision"
+          echo "--- tail of last agent response ---"
+          tail -c 2000 ask.ndjson 2>/dev/null || echo "(no response captured)"
+          exit 1
+
+      - name: Auto-revert traffic to previous revision (smoke failed)
+        if: failure() && steps.smoke.outcome == 'failure' && steps.prev.outputs.rev != ''
+        run: |
+          echo "::error::Auto-reverting traffic to ${{ steps.prev.outputs.rev }} — the new revision failed the agent smoke. Runbook: genos-docs operations/ROLLBACK.md"
+          gcloud run services update-traffic genos-api \
+            --project "$GCP_PROJECT" --region "$GCP_REGION" \
+            --to-revisions "${{ steps.prev.outputs.rev }}=100" --quiet
