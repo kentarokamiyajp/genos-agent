@@ -28,7 +28,7 @@ import logging
 import math
 import re
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from django.conf import settings
 from opensearchpy.exceptions import NotFoundError
@@ -330,6 +330,24 @@ def search(
 
     # --- Sort, apply relevance threshold, truncate to limit. ---
     grouped.sort(key=lambda x: x["score"], reverse=True)
+
+    # --- Mirror-entity collapse (quality round 2, flag-gated) ---
+    # The workspace mints several entities that MIRROR one another with
+    # the same display title: a project's PM channel is named after the
+    # project, a thread inherits its channel's title, a milestone's
+    # backing task shares its title, a DM is titled after the other
+    # person. On content queries these mirrors crowd the top-N with
+    # rows that all read identically (observed: "Q2 Roadmap · …" THREE
+    # times in one top-5 — project + channel + thread — pushing the
+    # actual gold below the cut). Collapse keeps the highest-ranked
+    # representative per (normalized title) ACROSS entity types;
+    # same-type rows with equal titles survive, since two tasks
+    # legitimately named alike are distinct results. This is entity
+    # ASSEMBLY (like _group_by_entity), not a relevance overlay, so it
+    # applies in eval mode too — the retrieval suite measures it.
+    if settings.SEARCH_ENGINE.get("RAG_COLLAPSE_MIRROR_RESULTS"):
+        grouped = _collapse_mirror_entities(grouped)
+
     pre_threshold = grouped  # keep the un-cut ranking for the floor restore
     grouped = _apply_relevance_threshold(grouped, min_score_ratio, min_score)
 
@@ -588,6 +606,50 @@ def _dedup_by_text_hash(hits: list[dict]) -> list[dict]:
             existing["score"] = hit["score"]
             existing["keyword_rank"] = hit.get("keyword_rank") or existing.get("keyword_rank")
             existing["vector_rank"] = hit.get("vector_rank") or existing.get("vector_rank")
+    return out
+
+
+def _collapse_mirror_entities(entities: list[dict]) -> list[dict]:
+    """Same-title mirror collapse (see call site for the why).
+
+    `entities` must already be sorted by score desc. Two rules:
+
+    1. Cross-type: the first (highest-ranked) row of a given normalized
+       title claims that title for its entity_type; later rows of OTHER
+       types with the same title are dropped as mirrors (a project's PM
+       channel, a milestone's backing task, a DM titled after the
+       person). Later rows of the SAME type keep — equal titles within
+       one type are genuinely distinct entities (two tasks both called
+       "Fix flaky test").
+    2. Chat surfaces: within entity_type "chat", rows sharing
+       (chat_id, title) are surfaces of the SAME channel — the channel
+       anchor plus its thread windows, which all inherit the channel's
+       display title. Keep only the highest-ranked one. A thread that
+       carries its OWN title, and two different channels that happen to
+       share a name, both survive (different key).
+
+    Untitled rows always pass through.
+    """
+    claimed_type: dict[str, str] = {}
+    chat_surfaces: set[tuple[Any, str]] = set()
+    out: list[dict] = []
+    for e in entities:
+        title = (e.get("title") or "").strip().lower()
+        if not title:
+            out.append(e)
+            continue
+        etype = e.get("entity_type") or ""
+        owner = claimed_type.get(title)
+        if owner is not None and owner != etype:
+            continue  # lower-ranked cross-type mirror
+        if etype == "chat":
+            surface_key = (e.get("chat_id"), title)
+            if surface_key in chat_surfaces:
+                continue  # another surface of the same channel
+            chat_surfaces.add(surface_key)
+        if owner is None:
+            claimed_type[title] = etype
+        out.append(e)
     return out
 
 

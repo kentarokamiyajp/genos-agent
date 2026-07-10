@@ -46,6 +46,7 @@ from origin.search_engine.agent.tools.base import REGISTRY, Tool, ToolContext, T
 from origin.search_engine.agent.tools.create_calendar_event import CREATE_CALENDAR_EVENT
 from origin.search_engine.agent.tools.create_note import CREATE_NOTE
 from origin.search_engine.agent.tools.create_task import CREATE_TASK
+from origin.search_engine.agent.tools.create_task_plan import CREATE_TASK_PLAN
 from origin.search_engine.agent.tools.create_todo_item import CREATE_TODO_ITEM
 from origin.search_engine.agent.tools.delete_calendar_event import DELETE_CALENDAR_EVENT
 from origin.search_engine.agent.tools.fetch_chat_thread import FETCH_CHAT_THREAD
@@ -85,6 +86,7 @@ from origin.search_engine.agent.tools.list_milestones import LIST_MILESTONES
 from origin.search_engine.agent.tools.list_my_inbox import LIST_MY_INBOX
 from origin.search_engine.agent.tools.list_my_mentions import LIST_MY_MENTIONS
 from origin.search_engine.agent.tools.list_my_milestones import LIST_MY_MILESTONES
+from origin.search_engine.agent.tools.list_note_folders import LIST_NOTE_FOLDERS
 from origin.search_engine.agent.tools.list_pr_comments import LIST_PR_COMMENTS
 from origin.search_engine.agent.tools.list_pr_commits import LIST_PR_COMMITS
 from origin.search_engine.agent.tools.list_pr_files import LIST_PR_FILES
@@ -92,6 +94,7 @@ from origin.search_engine.agent.tools.list_pr_reviews import LIST_PR_REVIEWS
 from origin.search_engine.agent.tools.list_project_members import LIST_PROJECT_MEMBERS
 from origin.search_engine.agent.tools.list_projects import LIST_PROJECTS
 from origin.search_engine.agent.tools.list_sprints import LIST_SPRINTS
+from origin.search_engine.agent.tools.list_task_dependencies import LIST_TASK_DEPENDENCIES
 from origin.search_engine.agent.tools.list_tasks import LIST_TASKS
 from origin.search_engine.agent.tools.list_today_todos import LIST_TODAY_TODOS
 from origin.search_engine.agent.tools.list_uncompleted_todos import LIST_UNCOMPLETED_TODOS
@@ -102,6 +105,7 @@ from origin.search_engine.agent.tools.search_past_conversations import (
 from origin.search_engine.agent.tools.update_calendar_event import UPDATE_CALENDAR_EVENT
 from origin.search_engine.agent.tools.update_note import UPDATE_NOTE
 from origin.search_engine.agent.tools.update_task import UPDATE_TASK
+from origin.search_engine.agent.tools.update_tasks_bulk import UPDATE_TASKS_BULK
 from origin.search_engine.agent.tools.update_todo_item import UPDATE_TODO_ITEM
 from origin.search_engine.agent.tools.web_search import SEARCH_WEB
 
@@ -117,6 +121,7 @@ for _t in (
     FETCH_TASK,
     FETCH_CHAT_THREAD,
     FETCH_NOTE,
+    LIST_NOTE_FOLDERS,
     # --- Read tools (Phase 13) ---
     LIST_PROJECTS,
     LIST_TASKS,
@@ -131,6 +136,9 @@ for _t in (
     UPDATE_TASK,
     ADD_COMMENT,
     CREATE_NOTE,
+    # --- Composite write tools (BAU Wave 1) — one approval per plan ---
+    CREATE_TASK_PLAN,
+    UPDATE_TASKS_BULK,
     # --- Write tools (Phase 13) ---
     ASSIGN_TASK,
     UPDATE_NOTE,
@@ -150,6 +158,8 @@ for _t in (
     LIST_SPRINTS,
     GET_SPRINT_SUMMARY,
     GET_TASK_BLOCKERS,
+    # --- Read tools (BAU Wave 1) — whole-scope dependency graph ---
+    LIST_TASK_DEPENDENCIES,
     # --- Read tools (Phase 16) — GitHub PR introspection ---
     FETCH_PR,
     LIST_PR_COMMENTS,
@@ -188,10 +198,12 @@ __all__ = [
     "CREATE_CALENDAR_EVENT",
     "CREATE_NOTE",
     "CREATE_TASK",
+    "CREATE_TASK_PLAN",
     "CREATE_TODO_ITEM",
     "DELETE_CALENDAR_EVENT",
     "FETCH_CHAT_THREAD",
     "FETCH_NOTE",
+    "LIST_NOTE_FOLDERS",
     "FETCH_PR",
     "FETCH_TASK",
     "GET_CURRENT_USER",
@@ -224,6 +236,7 @@ __all__ = [
     "LIST_PR_REVIEWS",
     "LIST_PROJECTS",
     "LIST_SPRINTS",
+    "LIST_TASK_DEPENDENCIES",
     "LIST_TASKS",
     "LIST_TODAY_TODOS",
     "LIST_UNCOMPLETED_TODOS",
@@ -235,6 +248,7 @@ __all__ = [
     "UPDATE_CALENDAR_EVENT",
     "UPDATE_NOTE",
     "UPDATE_TASK",
+    "UPDATE_TASKS_BULK",
     "UPDATE_TODO_ITEM",
     "SEARCH_WEB",
 ]

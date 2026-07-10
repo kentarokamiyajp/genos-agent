@@ -19,6 +19,7 @@ from django.core.exceptions import ValidationError
 
 from origin.models.chat.unified_models import Channel, ChannelMember
 from origin.models.note.common_note_models import NotePermissionMaster
+from origin.models.note.personal_note_models import PersonalNoteFolder
 from origin.models.project.prj_models import ProjectMembers
 from origin.models.task.milestone_models import MilestoneAssignees
 from origin.search_engine.chunkers.base import (
@@ -27,6 +28,25 @@ from origin.search_engine.chunkers.base import (
     NOTE_TYPE_PERSONAL,
     NOTE_TYPE_TASK,
 )
+
+
+def owns_personal_folder(*, folder_id, team_id: str, user_id: str) -> bool:
+    """True if `folder_id` is a personal-note folder owned by this user in
+    this team.
+
+    Personal-note folders are a pure per-owner organization layer — they
+    carry NO `NotePermissionMaster` rows and are never shared — so
+    ownership (team + owner) IS the whole ACL. Used by `create_note` /
+    `update_note` before filing or moving a note into a folder so the
+    agent can't drop a note into a folder that isn't the user's, even if
+    the model supplies an arbitrary id.
+    """
+    try:
+        return PersonalNoteFolder.objects.filter(
+            folder_id=folder_id, team=team_id, owner=user_id
+        ).exists()
+    except (ValueError, ValidationError):
+        return False
 
 
 def chat_acl_user_ids(chat_type_code: int, chat_id) -> set[str]:

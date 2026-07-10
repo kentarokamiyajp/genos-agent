@@ -35,9 +35,34 @@ log = logging.getLogger(__name__)
 _client: genai.Client | None = None
 
 
+def _retry_http_options(cfg: Any):
+    """HttpOptions enabling the SDK's transient-error retry, or None.
+
+    google-genai wraps request INITIATION in a tenacity retry when
+    `retry_options` is set — the streaming path included, but never
+    mid-stream, so a retried call can't double-yield chunks the
+    controller already consumed. Retryable by SDK default: HTTP
+    408/429/500/502/503/504 plus httpx connect/timeout errors, with
+    exponential backoff + jitter (initial 1s, base 2). We only pin
+    `attempts` (GEMINI_RETRY_ATTEMPTS, total including the first call)
+    and keep the SDK defaults for codes/delays.
+
+    Why: a transient Vertex 429 RESOURCE_EXHAUSTED used to hard-fail
+    the agent step (and poison the nightly tool_recall metric — issue
+    #46); one retried call rides out quota blips instead.
+    """
+    from google.genai import types  # noqa: PLC0415
+
+    attempts = int(cfg.get("GEMINI_RETRY_ATTEMPTS") or 0)
+    if attempts <= 1:
+        return None
+    return types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=attempts))
+
+
 def _build_client() -> genai.Client:
     """Construct the underlying Gemini SDK client from settings."""
     cfg = settings.SEARCH_ENGINE
+    http_options = _retry_http_options(cfg)
 
     if cfg.get("GEMINI_USE_VERTEX"):
         project = cfg.get("GEMINI_PROJECT") or ""
@@ -69,10 +94,13 @@ def _build_client() -> genai.Client:
                 project=project,
                 location=location,
                 credentials=credentials,
+                http_options=http_options,
             )
         # No explicit file → fall through to Application Default
         # Credentials (reads GOOGLE_APPLICATION_CREDENTIALS automatically).
-        return genai.Client(vertexai=True, project=project, location=location)
+        return genai.Client(
+            vertexai=True, project=project, location=location, http_options=http_options
+        )
 
     # Mode A: plain API key.
     api_key = cfg.get("GEMINI_API_KEY") or ""
@@ -83,7 +111,7 @@ def _build_client() -> genai.Client:
             "set GEMINI_USE_VERTEX=true plus GEMINI_PROJECT and "
             "GEMINI_SERVICE_ACCOUNT_FILE (or GOOGLE_APPLICATION_CREDENTIALS)."
         )
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key, http_options=http_options)
 
 
 def _get_client() -> genai.Client:

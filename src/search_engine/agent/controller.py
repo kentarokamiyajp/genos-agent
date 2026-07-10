@@ -256,6 +256,28 @@ def _resolve_todo_item_title(raw: Any) -> str | None:
     return ToDoItem.objects.filter(item_id=tid).values_list("title", flat=True).first()
 
 
+def _resolve_milestone_title(raw: Any) -> str | None:
+    try:
+        mid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    from origin.models.task.milestone_models import MilestoneMaster  # noqa: PLC0415
+
+    return (
+        MilestoneMaster.objects.filter(milestone_id=mid).values_list("title", flat=True).first()
+    )
+
+
+def _resolve_note_folder_name(raw: Any) -> str | None:
+    try:
+        fid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    from origin.models.note.personal_note_models import PersonalNoteFolder  # noqa: PLC0415
+
+    return PersonalNoteFolder.objects.filter(folder_id=fid).values_list("name", flat=True).first()
+
+
 # Argument-key → resolver. Resolvers return None on a miss so we fall
 # back to the raw value (the user sees the ID rather than a blank).
 _FRIENDLY_ARG_RESOLVERS: dict[str, Callable[[Any], str | None]] = {
@@ -266,16 +288,152 @@ _FRIENDLY_ARG_RESOLVERS: dict[str, Callable[[Any], str | None]] = {
     "new_assignee_id": _resolve_user_name,
     "item_id": _resolve_todo_item_title,
     "parent_item_id": _resolve_todo_item_title,
+    "milestone_id": _resolve_milestone_title,
+    "existing_milestone_id": _resolve_milestone_title,
+    "parent_task_id": _resolve_task_display_id,
+    # Only the note tools take `folder_id` (My-Notes sidebar folders).
+    "folder_id": _resolve_note_folder_name,
 }
 
 
-def _friendly_arguments(args: dict[str, Any]) -> dict[str, Any]:
+def _friendly_task_plan_arguments(out: dict[str, Any]) -> None:
+    """In-place nested enrichment for `create_task_plan` arguments.
+
+    The flat resolver pass above only touches top-level keys; a plan's
+    assignees live inside `tasks[i].assignee_id` and
+    `milestone.assignee_ids`. Resolve them all with ONE batched user
+    query so the approval card shows usernames, not UUIDs. Structure is
+    otherwise preserved — the frontend's structured preview renders the
+    same shape the model proposed.
+    """
+    from origin.models.common.user_models import CustomUser  # noqa: PLC0415
+
+    tasks = out.get("tasks") if isinstance(out.get("tasks"), list) else []
+    milestone = out.get("milestone") if isinstance(out.get("milestone"), dict) else None
+
+    ids: set[str] = set()
+    for t in tasks:
+        if isinstance(t, dict) and t.get("assignee_id"):
+            ids.add(str(t["assignee_id"]))
+    if milestone:
+        for uid in milestone.get("assignee_ids") or []:
+            if uid:
+                ids.add(str(uid))
+    if not ids:
+        return
+
+    names = {
+        str(u_id): username
+        for u_id, username in CustomUser.objects.filter(id__in=list(ids)).values_list(
+            "id", "username"
+        )
+    }
+    new_tasks = []
+    for t in tasks:
+        if isinstance(t, dict) and t.get("assignee_id"):
+            t = {**t, "assignee_id": names.get(str(t["assignee_id"]), t["assignee_id"])}
+        new_tasks.append(t)
+    out["tasks"] = new_tasks
+    if milestone and milestone.get("assignee_ids"):
+        out["milestone"] = {
+            **milestone,
+            "assignee_ids": [
+                names.get(str(uid), uid) for uid in milestone["assignee_ids"] if uid
+            ],
+        }
+
+
+def _friendly_bulk_update_arguments(out: dict[str, Any]) -> None:
+    """In-place nested enrichment for `update_tasks_bulk` arguments.
+
+    Each update row gains `display_id` / `title` and a `current` snapshot
+    of the fields the tool can change (one batched query for the whole
+    batch), so the approval card can render a true old→new diff table.
+    The proposed values and `task_id` stay untouched — the persisted
+    `arguments_json` is raw anyway; this only shapes the wire event.
+    """
+    updates = out.get("updates")
+    if not isinstance(updates, list) or not updates:
+        return
+
+    from origin.models.task.task_models import TaskMaster  # noqa: PLC0415
+
+    ids: list[int] = []
+    for row in updates:
+        if isinstance(row, dict):
+            try:
+                ids.append(int(row.get("task_id")))
+            except (TypeError, ValueError):
+                continue
+    if not ids:
+        return
+
+    by_id = {
+        t.task_id: t
+        for t in TaskMaster.objects.select_related("project").filter(task_id__in=ids)
+    }
+    new_updates = []
+    for row in updates:
+        if isinstance(row, dict):
+            try:
+                task = by_id.get(int(row.get("task_id")))
+            except (TypeError, ValueError):
+                task = None
+            if task is not None:
+                row = {
+                    **row,
+                    "display_id": task.display_id,
+                    "title": task.title,
+                    "current": {
+                        "priority": task.priority,
+                        "effort_level": task.effort_level,
+                        "status": task.status,
+                        "due_date": task.due_date.isoformat() if task.due_date else None,
+                    },
+                }
+        new_updates.append(row)
+    out["updates"] = new_updates
+
+
+def _friendly_update_note_arguments(out: dict[str, Any]) -> None:
+    """In-place nested enrichment for `update_note` arguments.
+
+    ADDS `note_title` (resolved from the note tables) so the approval
+    card can say which note is being edited. `note_id` itself is left
+    numeric — unlike the flat resolvers this must not replace the key,
+    because the preview needs both the label and the raw id."""
+    ntype = str(out.get("note_type") or "").lower()
+    try:
+        nid = int(out.get("note_id"))
+    except (TypeError, ValueError):
+        return
+    from origin.models.note.personal_note_models import PersonalNoteMaster  # noqa: PLC0415
+    from origin.models.note.task_note_models import TaskNoteMaster  # noqa: PLC0415
+
+    model = {"personal": PersonalNoteMaster, "task": TaskNoteMaster}.get(ntype)
+    if model is None:
+        return
+    title = model.objects.filter(note_id=nid).values_list("title", flat=True).first()
+    if title:
+        out["note_title"] = title
+
+
+# Tool-name → nested enrichment pass, applied after the flat resolvers.
+_FRIENDLY_NESTED_ENRICHERS: dict[str, Callable[[dict[str, Any]], None]] = {
+    "create_task_plan": _friendly_task_plan_arguments,
+    "update_tasks_bulk": _friendly_bulk_update_arguments,
+    "update_note": _friendly_update_note_arguments,
+}
+
+
+def _friendly_arguments(args: dict[str, Any], tool_name: str | None = None) -> dict[str, Any]:
     """Return a copy of `args` with raw IDs replaced by human labels.
 
     Applied only at the wire-event boundary (the approval card + tool
     progress strip render this). The persisted `arguments_json` keeps
     the canonical primary keys so the resume path re-runs the tool
-    correctly.
+    correctly. `tool_name` selects an optional nested enrichment pass
+    for composite tools whose IDs live below the top level.
     """
     out: dict[str, Any] = {}
     for key, value in args.items():
@@ -289,6 +447,13 @@ def _friendly_arguments(args: dict[str, Any]) -> dict[str, Any]:
             out[key] = friendly if friendly is not None else value
         else:
             out[key] = value
+
+    enricher = _FRIENDLY_NESTED_ENRICHERS.get(tool_name or "")
+    if enricher is not None:
+        try:
+            enricher(out)
+        except Exception:  # noqa: BLE001 — labels never break the loop
+            log.exception("Nested friendly-arg enrichment failed for %s", tool_name)
     return out
 
 
@@ -608,6 +773,51 @@ def _ui_sources_from_tool_result(call_name: str, result: dict[str, Any]) -> list
             )
         ]
 
+    if call_name == "create_task_plan":
+        # Approved plan → chips for everything it created, so the final
+        # answer's citations resolve and the user can click straight
+        # into the new milestone/tasks. Capped like other multi-row chips.
+        sources: list[dict[str, Any]] = []
+        pid = result.get("project_id")
+        ms = result.get("milestone") or {}
+        if ms.get("milestone_id"):
+            sources.append(
+                _milestone_source(ms["milestone_id"], ms.get("title"), pid, ms.get("task_id"))
+            )
+        parent = result.get("parent_task") or {}
+        if parent.get("task_id"):
+            # Sub-task mode: chip for the anchor task the batch nested under.
+            sources.append(
+                _task_source(
+                    parent["task_id"],
+                    parent.get("title"),
+                    pid,
+                    display_id=parent.get("display_id"),
+                )
+            )
+        for t in (result.get("tasks") or [])[:10]:
+            if t.get("task_id"):
+                sources.append(
+                    _task_source(t["task_id"], t.get("title"), pid, display_id=t.get("display_id"))
+                )
+        if pid:
+            sources.append(_project_source(pid, result.get("project_name")))
+        return sources
+
+    if call_name == "update_tasks_bulk":
+        # Approved organize pass → chips for the touched tasks so the
+        # answer's "I bumped X to Critical" citations resolve.
+        return [
+            _task_source(
+                row.get("task_id"),
+                row.get("title"),
+                row.get("project_id"),
+                display_id=row.get("display_id"),
+            )
+            for row in (result.get("updated") or [])[:10]
+            if row.get("task_id")
+        ]
+
     if call_name == "list_projects":
         return [
             _project_source(p.get("project_id"), p.get("project_name"))
@@ -628,7 +838,11 @@ def _ui_sources_from_tool_result(call_name: str, result: dict[str, Any]) -> list
             return []
         return [_chat_source(chat_type, chat_id, result.get("thread_id"))]
 
-    if call_name == "fetch_note":
+    if call_name in ("fetch_note", "create_note", "update_note"):
+        # The two write tools return the same note_id / note_type /
+        # title / parent_context fields as fetch_note, so one branch
+        # gives approved note writes a clickable chip too (emitted via
+        # the resume path's write-result pass).
         nid = result.get("note_id")
         ntype = result.get("note_type")
         if not nid or not ntype:
@@ -1148,6 +1362,9 @@ def resume_agent(
         args=call_args,
         thought_signature=_coerce_signature(pending_step.thought_signature),
     )
+    # Chips created by an approved write (filled in the approve branch);
+    # doubles as the continued loop's sources dedup seed.
+    resumed_sources: dict[tuple[Any, Any], dict[str, Any]] = {}
 
     # Emit the start event the original run skipped. Same step index so
     # the frontend can correlate the approve/reject card with the row
@@ -1157,7 +1374,7 @@ def resume_agent(
             "type": "tool_call_start",
             "step": step_index,
             "tool_name": call_name,
-            "arguments": _friendly_arguments(call_args),
+            "arguments": _friendly_arguments(call_args, call_name),
         }
     )
 
@@ -1247,14 +1464,25 @@ def resume_agent(
                 messages.append(_function_response_turn(call_name, {"error": err}))
             else:
                 summary = result.pop("__summary__", "ok")
-                emit(
-                    {
-                        "type": "tool_call_result",
-                        "step": step_index,
-                        "tool_name": call_name,
-                        "summary": summary,
+                result_event = {
+                    "type": "tool_call_result",
+                    "step": step_index,
+                    "tool_name": call_name,
+                    "summary": summary,
+                }
+                # Approved note writes carry a compact `note` ref so the
+                # frontend can refresh caches and (for body updates) push
+                # the new blocks into the live Yjs doc. Additive — older
+                # frontends destructure known fields and ignore this.
+                if call_name in ("create_note", "update_note"):
+                    note_ref = {
+                        k: result.get(k)
+                        for k in ("note_id", "note_type", "title", "changed_fields")
+                        if result.get(k) is not None
                     }
-                )
+                    if note_ref.get("note_id"):
+                        result_event["note"] = note_ref
+                emit(result_event)
                 # C3: an APPROVED write just changed the workspace, so
                 # every cached read this session made before it is now
                 # suspect — drop them all (generation bump, O(1)).
@@ -1269,18 +1497,39 @@ def resume_agent(
                         "Failed to update pending step %s after approve",
                         pending_step.step_id,
                     )
+                # Chips for entities the approved write CREATED (e.g. a
+                # create_task_plan's milestone + tasks) so the final
+                # answer's citations resolve to clickable previews.
+                # Mirrors the seeded-sources pattern in run_agent: emit
+                # once here, then seed the continued loop's dedup map so
+                # later read-tools don't re-add (and cumulative `sources`
+                # events keep including them). Tools without a
+                # _ui_sources_from_tool_result branch return [] — no
+                # behavior change for the other write tools.
+                for src in _ui_sources_from_tool_result(call_name, result):
+                    key = (src.get("entity_type"), src.get("entity_id"))
+                    if all(key) and key not in resumed_sources:
+                        resumed_sources[key] = src
+                if resumed_sources:
+                    hydrated = _hydrate_task_display_ids(
+                        _apply_friendly_titles(list(resumed_sources.values()), ctx)
+                    )
+                    emit({"type": "sources", "sources": hydrated})
                 messages.append(_assistant_function_call_turn(function_call))
                 messages.append(_function_response_turn(call_name, result))
 
     # Continue the loop from the next step. The original run wrote
     # steps 0..step_index inclusive, so we resume at step_index + 1.
+    # `resumed_sources` seeds the dedup map with chips the approved
+    # write emitted above; pre-approval `sources` events were already
+    # sent in the original stream and are not re-seeded.
     return _drive_loop(
         messages=messages,
         ctx=ctx,
         emit=emit,
         run_id=run.run_id,
         starting_step=step_index + 1,
-        seen_sources_by_id={},  # `sources` events were sent in the original stream; don't double-emit.
+        seen_sources_by_id=resumed_sources,
         session_id=str(run.session_id) if run.session_id else None,
     )
 
@@ -1643,7 +1892,7 @@ def _drive_loop(
                         "type": "tool_call_start",
                         "step": step,
                         "tool_name": call.name,
-                        "arguments": _friendly_arguments(dict(call.args)),
+                        "arguments": _friendly_arguments(dict(call.args), call.name),
                     }
                 )
             starts_pre_emitted = True
@@ -1662,7 +1911,7 @@ def _drive_loop(
                         "type": "tool_call_start",
                         "step": step,
                         "tool_name": call_name,
-                        "arguments": _friendly_arguments(call_args),
+                        "arguments": _friendly_arguments(call_args, call_name),
                     }
                 )
                 err = f"Unknown tool: {call_name}"
@@ -1705,7 +1954,7 @@ def _drive_loop(
                     "type": "tool_call_pending_approval",
                     "step": step,
                     "tool_name": call_name,
-                    "arguments": _friendly_arguments(call_args),
+                    "arguments": _friendly_arguments(call_args, call_name),
                     "approval_token": str(approval_token),
                 }
                 if run_id is not None:
@@ -1732,7 +1981,7 @@ def _drive_loop(
                         "type": "tool_call_start",
                         "step": step,
                         "tool_name": call_name,
-                        "arguments": _friendly_arguments(call_args),
+                        "arguments": _friendly_arguments(call_args, call_name),
                     }
                 )
             if call_idx in precomputed:

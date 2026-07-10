@@ -102,6 +102,11 @@ class CaseResult:
     # `answer_delta` event (the strict TTFT metric). -1 if no
     # answer_delta was ever emitted (model errored or returned no text).
     ttft_ms: int = -1
+    # The run died on an LLM-provider infrastructure error (Vertex 429
+    # quota / 5xx) even after one retry. Counted as not-passed but
+    # EXCLUDED from continuous metrics and reported separately — infra
+    # weather must not read as an agent-quality regression.
+    infra_error: bool = False
     # Optional LLM-judge scores; only set when `--judge` was on.
     judge_scores: dict[str, Any] | None = None
     # Continuous quality metrics layered on top of the binary pass/fail
@@ -127,6 +132,37 @@ def load_cases(path: Path = BEHAVIOR_CASES_PATH) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Behavior mode (Phase 4 — agent-loop assertions)                             #
 # --------------------------------------------------------------------------- #
+
+
+# Seconds to wait before the single infra retry — long enough for a
+# transient Vertex 429 burst to clear, short enough not to blow up a
+# 131-case suite run when quota is genuinely gone.
+INFRA_RETRY_SLEEP_S = 20
+
+# Signatures of LLM-provider infrastructure failures in fatal `error`
+# events (the controller prefixes them "LLM call failed: ..."). Matched
+# only inside that prefix so an agent ANSWER mentioning "quota" can
+# never trip it.
+_INFRA_SIGNATURES = (
+    "429",
+    "resource_exhausted",
+    "resource exhausted",
+    "quota",
+    "503",
+    "unavailable",
+    "deadline exceeded",
+)
+
+
+def _infra_failure(events: list[dict[str, Any]]) -> bool:
+    """True when the run died on provider infrastructure, not behavior."""
+    for e in events:
+        if e.get("type") != "error":
+            continue
+        msg = (e.get("message") or "").lower()
+        if "llm call failed" in msg and any(s in msg for s in _INFRA_SIGNATURES):
+            return True
+    return False
 
 
 def run_behavior_case(case: dict[str, Any]) -> CaseResult:
@@ -184,31 +220,51 @@ def run_behavior_case(case: dict[str, Any]) -> CaseResult:
             )
             cleanup_handles.append(handle)
 
-        events: list[dict[str, Any]] = []
-        tool_traces: list[dict[str, Any]] = []
-        # Phase 4.4 — capture per-event timing to compute TTFT.
-        # Wrapping the emit callback is the smallest non-invasive hook
-        # (controller code untouched). Timestamps are relative to the
-        # run_agent invocation, in seconds.
-        emit_t0 = time.monotonic()
-        ttft_s: float | None = None
-
-        def _ts_emit(event: dict[str, Any]) -> None:
-            nonlocal ttft_s
-            if (
-                ttft_s is None
-                and event.get("type") == "answer_delta"
-                and (event.get("text") or "")
-            ):
-                ttft_s = time.monotonic() - emit_t0
-            events.append(event)
-
-        def _capture_trace(name: str, args: dict[str, Any], result: dict[str, Any]) -> None:
-            tool_traces.append({"tool_name": name, "arguments": args, "result": result})
-
         ctx = ToolContext(team_id=team_id, user_id=user_id)
-        try:
+
+        def _attempt() -> tuple[list[dict[str, Any]], list[dict[str, Any]], float | None]:
+            """One full agent run with event / trace / TTFT capture.
+
+            Phase 4.4 — wrapping the emit callback is the smallest
+            non-invasive timing hook (controller code untouched);
+            timestamps are relative to the run_agent invocation.
+            """
+            attempt_events: list[dict[str, Any]] = []
+            attempt_traces: list[dict[str, Any]] = []
+            emit_t0 = time.monotonic()
+            ttft: float | None = None
+
+            def _ts_emit(event: dict[str, Any]) -> None:
+                nonlocal ttft
+                if (
+                    ttft is None
+                    and event.get("type") == "answer_delta"
+                    and (event.get("text") or "")
+                ):
+                    ttft = time.monotonic() - emit_t0
+                attempt_events.append(event)
+
+            def _capture_trace(
+                name: str, args: dict[str, Any], result: dict[str, Any]
+            ) -> None:
+                attempt_traces.append({"tool_name": name, "arguments": args, "result": result})
+
             run_agent(query, ctx, _ts_emit, run_id=None, trace_hook=_capture_trace)
+            return attempt_events, attempt_traces, ttft
+
+        try:
+            events, tool_traces, ttft_s = _attempt()
+            # LLM-provider infrastructure failure (Vertex 429 quota /
+            # 5xx): not an agent-quality signal. Retry once after a
+            # breather — transient quota noise usually clears. If it
+            # persists, the case is flagged `infra_error` and EXCLUDED
+            # from continuous metrics, so e.g. the tool_recall
+            # north-star can't be breached by quota weather (exactly
+            # what happened on the 2026-07-09 nightly: two 429'd cases
+            # scored tool_recall=0.0 and "breached" the floor).
+            if _infra_failure(events):
+                time.sleep(INFRA_RETRY_SLEEP_S)
+                events, tool_traces, ttft_s = _attempt()
         except Exception as e:  # noqa: BLE001 — report as failure rather than crash the suite
             duration_ms = int((time.monotonic() - started) * 1000)
             return CaseResult(
@@ -218,7 +274,10 @@ def run_behavior_case(case: dict[str, Any]) -> CaseResult:
                 failure_reasons=[f"run_agent crashed: {e!r}"],
             )
 
+        infra = _infra_failure(events)
         reasons = _check_behavior_expectations(events, expect)
+        if infra:
+            reasons = ["infra: LLM-provider failure after retry (excluded from metrics)"] + reasons
         duration_ms = int((time.monotonic() - started) * 1000)
 
         tool_calls = [e for e in events if e.get("type") == "tool_call_start"]
@@ -245,7 +304,13 @@ def run_behavior_case(case: dict[str, Any]) -> CaseResult:
             sources=list(last_sources),
             tool_results=tool_traces,
             ttft_ms=int(ttft_s * 1000) if ttft_s is not None else -1,
-            metrics={
+            infra_error=infra,
+            # Infra-errored runs carry NO metrics: a 429'd run's
+            # tool_recall=0 is noise, not signal, and would drag the
+            # north-star aggregate below its floor.
+            metrics={}
+            if infra
+            else {
                 **_tool_selection_metrics(events, expect),
                 **_abstention_metric(events, expect),
                 **_citation_style_metric(events, expect),
@@ -378,8 +443,14 @@ def _run_multiturn_case(case: dict[str, Any], case_id: str) -> CaseResult:
         last_tool_traces = tool_traces
         last_ttft_s = per_turn_ttft_s
 
-    # Score only the final turn.
+    # Score only the final turn. Infra detection but no retry here —
+    # replaying every prior turn to retry the last one would multiply
+    # LLM spend; flagging + excluding from metrics is the part that
+    # protects the aggregates.
+    infra = _infra_failure(last_events)
     reasons = _check_behavior_expectations(last_events, final_expect)
+    if infra:
+        reasons = ["infra: LLM-provider failure (excluded from metrics)"] + reasons
     duration_ms = int((time.monotonic() - started) * 1000)
 
     tool_calls = [e for e in last_events if e.get("type") == "tool_call_start"]
@@ -402,7 +473,10 @@ def _run_multiturn_case(case: dict[str, Any], case_id: str) -> CaseResult:
         sources=list(last_sources),
         tool_results=last_tool_traces,
         ttft_ms=int(last_ttft_s * 1000) if last_ttft_s is not None else -1,
-        metrics={
+        infra_error=infra,
+        metrics={}
+        if infra
+        else {
             **_tool_selection_metrics(last_events, final_expect),
             **_abstention_metric(last_events, final_expect),
             **_citation_style_metric(last_events, final_expect),
@@ -609,6 +683,13 @@ def _check_behavior_expectations(
 
     tools_used = [e.get("tool_name") for e in events if e.get("type") == "tool_call_start"]
     tool_call_count = len(tools_used)
+    # Write-tool PROPOSALS never emit `tool_call_start` pre-approval —
+    # the run pauses on `tool_call_pending_approval` instead — so
+    # asserting "the model proposed write tool X" needs its own event
+    # set (`pending_tools_contains` below).
+    tools_pending = [
+        e.get("tool_name") for e in events if e.get("type") == "tool_call_pending_approval"
+    ]
     tool_errors = [e for e in events if e.get("type") == "tool_call_error"]
     fatal_errors = [e for e in events if e.get("type") == "error"]
     answer = "".join(e.get("text") or "" for e in events if e.get("type") == "answer_delta")
@@ -643,12 +724,32 @@ def _check_behavior_expectations(
         if missing:
             _add(f"tools_used_contains: missing {sorted(missing)} (saw {sorted(seen)})")
 
+    if "tools_used_contains_any" in expect:
+        # At least ONE of the listed tools ran — for questions with more
+        # than one legitimate route (e.g. "my high priority open tasks"
+        # is answerable via list_tasks OR get_my_focus_tasks; demanding
+        # one exact tool made the case a chronic false FAIL while the
+        # judge scored the answer 1.0 across the board).
+        accepted = set(expect["tools_used_contains_any"])
+        if not accepted & set(tools_used):
+            _add(
+                f"tools_used_contains_any: none of {sorted(accepted)} ran "
+                f"(saw {sorted(set(tools_used))})"
+            )
+
     if "tools_used_excludes" in expect:
         forbidden = set(expect["tools_used_excludes"])
         seen = set(tools_used)
         leaked = forbidden & seen
         if leaked:
             _add(f"tools_used_excludes: forbidden tool was used: {sorted(leaked)}")
+
+    if "pending_tools_contains" in expect:
+        required = set(expect["pending_tools_contains"])
+        seen = set(tools_pending)
+        missing = required - seen
+        if missing:
+            _add(f"pending_tools_contains: missing {sorted(missing)} (saw {sorted(seen)})")
 
     if "answer_contains_any" in expect:
         needles = [s.lower() for s in expect["answer_contains_any"]]
@@ -712,6 +813,20 @@ def _check_behavior_expectations(
                     f"tool_call_errors_contain: no tool_call_error matched {needle!r} "
                     f"(errors: {error_msgs})"
                 )
+
+    if "tool_call_errors_contain_any" in expect:
+        # ANY-of variant — for denials whose exact phrasing is a security
+        # choice, not a contract: chat ACL errors deliberately say
+        # "not found or has no members" so an outsider can't probe which
+        # chat ids exist. The case asserts the request was refused, not
+        # the refusal's wording.
+        substrs = [s.lower() for s in expect["tool_call_errors_contain_any"]]
+        error_msgs = [(e.get("error") or "").lower() for e in tool_errors]
+        if not any(needle in msg for needle in substrs for msg in error_msgs):
+            _add(
+                f"tool_call_errors_contain_any: no tool_call_error matched any of "
+                f"{substrs} (errors: {error_msgs})"
+            )
 
     if "no_errors" in expect and expect["no_errors"]:
         if fatal_errors:

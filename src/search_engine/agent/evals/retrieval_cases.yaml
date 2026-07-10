@@ -66,11 +66,17 @@
   fixture: true
   query: "What's the perf budget for the marketing site?"
   expect:
-    # Either the spike task or the design-system migration task
-    # (which mentions Lighthouse ≥ 95 + JS ≤ 120KB in the body).
-    must_contain_title_in_top_n:
+    # ANY perf-budget-bearing entity in the top 5 satisfies the intent:
+    # the spike task (40KB footprint vs the budget), the "Approve perf
+    # budget thresholds" todo (carries the Lighthouse ≥ 95 + JS ≤ 120KB
+    # numbers verbatim), or the design-system migration task. Switched
+    # from the single-title AND matcher when the fixture gained the
+    # mobile-performance planning thread on the Safari task — a third
+    # legitimately perf-relevant entity that can outrank the spike
+    # under query rewriting without being a retrieval regression.
+    must_contain_any_title_in_top_n:
       n: 5
-      title_substrings: ["framer-motion"]
+      title_substrings: ["framer-motion", "perf budget", "design system v3"]
 
 - id: framer_motion_decision_surfaces_spike
   fixture: true

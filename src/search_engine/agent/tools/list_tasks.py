@@ -188,6 +188,7 @@ def _run(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                 "title": t.title,
                 "status": t.status,
                 "priority": t.priority,
+                "effort_level": t.effort_level,
                 "due_date": t.due_date.isoformat() if t.due_date else None,
                 "assignee_id": str(t.assignee_id) if t.assignee_id else None,
                 "project_id": t.project_id,

@@ -155,7 +155,13 @@
   team_id: "6f9de2de-faac-4eff-9034-e5a8e1764da2"
   user_id: "00000000-0000-0000-0000-000000000000"
   expect:
-    tool_call_errors_contain: ["not authorized"]
+    # The chat ACL error deliberately says "not found or has no members"
+    # instead of "not authorized" — an outsider must not be able to
+    # probe which chat ids exist. The case asserts the request was
+    # REFUSED, whichever phrasing the tool uses (this was a chronic
+    # false-FAIL on every nightly while the judge scored the refusal
+    # 1.0 across the board).
+    tool_call_errors_contain_any: ["not authorized", "not found or has no members"]
 
 # --------------------------------------------------------------------- #
 # F. Prompt-injection adversarial (3)                                    #
@@ -497,7 +503,11 @@
   query: "Show me my high priority open tasks."
   fixture: true
   expect:
-    tools_used_contains: ["list_tasks"]
+    # "MY high priority open tasks" has two legitimate routes:
+    # list_tasks(assignee, priority, status) or get_my_focus_tasks.
+    # Demanding list_tasks alone made this a chronic false-FAIL (the
+    # judge scored the get_my_focus_tasks answer 1.0 across the board).
+    tools_used_contains_any: ["list_tasks", "get_my_focus_tasks"]
     no_errors: true
 
 # --------------------------------------------------------------------- #
@@ -872,4 +882,135 @@
   expect:
     tools_used_contains: ["get_team_members"]
     tools_used_excludes: ["list_project_members"]
+    no_errors: true
+
+# --------------------------------------------------------------------- #
+# W. Composite plan writes (BAU Wave 1 — create_task_plan)              #
+# --------------------------------------------------------------------- #
+# One approval for a whole milestone + task tree. The routing risk this
+# section guards: the model falling back to a SERIES of create_task
+# proposals (one approval per task, no nesting/dependencies) instead of
+# ONE create_task_plan proposal. Write proposals pause the run on
+# `tool_call_pending_approval` (no tool_call_start is emitted), so
+# these use the `pending_tools_contains` expectation key.
+
+- id: composite_plan_single_proposal
+  query: >-
+    Create a milestone called "Beta launch" due 2026-08-31 in the
+    Website Redesign project with three tasks: "Design review" (High
+    priority), "Implementation" which is blocked by the design review,
+    and "QA pass" blocked by implementation.
+  fixture: true
+  expect:
+    pending_tools_contains: ["create_task_plan"]
+    tools_used_excludes: ["create_task"]
+    no_errors: true
+
+- id: composite_tasks_only_existing_milestone
+  # Tasks-only mode: attach to the fixture's existing milestone instead
+  # of creating a new one (existing_milestone_id path). The model must
+  # resolve the milestone id first (list_milestones) rather than guess.
+  query: >-
+    Add two follow-up tasks to the "v1.0 Public Launch" milestone in the
+    Website Redesign project: "Post-launch analytics review" and
+    "Collect early user feedback".
+  fixture: true
+  expect:
+    pending_tools_contains: ["create_task_plan"]
+    tools_used_excludes: ["create_task"]
+    no_errors: true
+
+# Negative — a SINGLE ad-hoc task must still route to create_task, not
+# get inflated into a one-task "plan". Metric-only (`forbidden_tools`)
+# until a validating run confirms the routing, per the section-P house
+# convention above.
+- id: negtool_single_task_not_plan
+  query: "Add a task to the Website Redesign project to buy more coffee for the office."
+  fixture: true
+  expect:
+    no_errors: true
+    forbidden_tools: ["create_task_plan"]
+
+- id: bulk_prioritize_milestone
+  # Organize flow: read current state (list_tasks; the dependency graph
+  # via list_task_dependencies is metric-only gold — the model may
+  # legitimately skip it when the milestone has no edges), then ONE
+  # update_tasks_bulk proposal — never serial update_task calls.
+  query: >-
+    Reprioritize the tasks in the "v1.0 Public Launch" milestone of the
+    Website Redesign project: blockers of unfinished work first, adjust
+    due dates where they contradict the dependency order, and explain
+    each change.
+  fixture: true
+  expect:
+    tools_used_contains: ["list_tasks"]
+    pending_tools_contains: ["update_tasks_bulk"]
+    tools_used_excludes: ["update_task"]
+    no_errors: true
+    expected_tools: ["list_tasks", "list_task_dependencies"]
+
+- id: composite_subtasks_under_existing_task
+  # Sub-task mode: work that already lives in a task must NOT become a
+  # new milestone — the batch nests under the existing task via
+  # parent_task_id. The agent reads the task's comments first
+  # (fetch_task returns them) so the split is grounded in the actual
+  # discussion.
+  query: >-
+    Break the "Investigate slow homepage load on mobile Safari" task in
+    the Website Redesign project into sub-tasks based on its comments.
+  fixture: true
+  expect:
+    tools_used_contains: ["fetch_task"]
+    pending_tools_contains: ["create_task_plan"]
+    tools_used_excludes: ["create_task"]
+    no_errors: true
+
+# ---------------------------------------------------------------------------
+# Section N — note-writing flows (BAU Wave 2): research → my-note, plan
+# document → task note, refine an existing note. Same pause semantics as
+# section W: the run stops at the FIRST write proposal, so
+# `pending_tools_contains: ["create_note"]` inherently proves the model
+# did not propose create_task_plan for these queries (and the existing
+# composite_subtasks_under_existing_task case guards the reverse
+# direction — "break into sub-tasks" must still pause at
+# create_task_plan, never create_note).
+
+- id: research_note_single_proposal
+  # Research → my-note: gather REAL findings first (web for
+  # best-practice content), then ONE create_note proposal (personal).
+  query: >-
+    Research current best practices for structuring B2B SaaS onboarding
+    flows and save what you find as a note called "Onboarding research".
+  fixture: true
+  expect:
+    tools_used_contains: ["search_web"]
+    pending_tools_contains: ["create_note"]
+    no_errors: true
+
+- id: plan_note_for_task
+  # Plan DOCUMENT for an existing task → a task note attached to that
+  # task (create_note note_type='task' + task_id) — NOT create_task_plan
+  # (that creates tasks) and NOT a milestone. fetch_task first so the
+  # plan is grounded in the task's body + comments.
+  query: >-
+    Write a plan document for the "Investigate slow homepage load on
+    mobile Safari" task in the Website Redesign project and save it as
+    a note on that task.
+  fixture: true
+  expect:
+    tools_used_contains: ["fetch_task"]
+    pending_tools_contains: ["create_note"]
+    tools_used_excludes: ["create_task"]
+    no_errors: true
+
+- id: refine_note_flow
+  # Refine: read the current body FIRST (fetch_note), then ONE
+  # update_note proposal carrying the full new body.
+  query: >-
+    Refine my "Spotlight tips" note — improve the structure and clarity,
+    but keep all of the content.
+  fixture: true
+  expect:
+    tools_used_contains: ["fetch_note"]
+    pending_tools_contains: ["update_note"]
     no_errors: true

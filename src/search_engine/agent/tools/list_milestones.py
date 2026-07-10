@@ -119,6 +119,11 @@ def _run(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                 "milestone_id": m.milestone_id,
                 "project_id": m.project_id,
                 "project_name": m.project.project_name if m.project_id else None,
+                # Backing task (every milestone is mirrored by a task row;
+                # None for legacy milestones created before the mirror).
+                # Needed to attach a plan NOTE to a milestone — task notes
+                # hang off a task_id.
+                "task_id": m.task_id,
                 "title": m.title,
                 "status": m.status,
                 "priority": m.priority,
@@ -157,8 +162,10 @@ LIST_MILESTONES = Tool(
         "`get_milestone_summary(milestone_id)` for a deeper per-milestone "
         "breakdown (status/priority/effort splits, assignee list). "
         "Counts include subtasks via the same Q-union as the milestone "
-        "table view. Scoped to milestones in projects the current user "
-        "is a member of."
+        "table view. Each row's task_id is the milestone's BACKING task "
+        "(use it e.g. to attach a plan note to the milestone; null on "
+        "legacy milestones). Scoped to milestones in projects the "
+        "current user is a member of."
     ),
     parameters_schema={
         "type": "OBJECT",

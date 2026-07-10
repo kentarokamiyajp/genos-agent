@@ -91,8 +91,36 @@ from origin.views.common.base_auth_api_view import AuthenticatedAPIView
 
 log = logging.getLogger(__name__)
 
-# Answer truncation for session history — keeps the context budget bounded.
-_PRIOR_ANSWER_MAX_CHARS = 400
+# Answer truncation for session history — keeps the context budget bounded
+# while still holding a *whole* prior answer verbatim. The old 400-char cap
+# was small enough that a follow-up like "save that answer to my note" or
+# "expand on that" only ever saw the first paragraph of the prior answer —
+# the rest wasn't in context, so the model couldn't reproduce it. Sized to
+# comfortably hold a full answer (answers are already bounded by the model's
+# max output tokens, ~4k → ~16k chars). Applied uniformly across the whole
+# verbatim window (SESSION_MAX_PRIOR_TURNS), so a two-turns-back answer
+# ("no, include ALL of it") is preserved too, not just the most recent.
+# Tunable per deploy via SEARCH_ENGINE["SESSION_PRIOR_ANSWER_MAX_CHARS"].
+_DEFAULT_PRIOR_ANSWER_MAX_CHARS = 12000
+
+def _persisted_disabled_tools(user) -> set[str]:
+    """Per-request tool gates derived from the user's PERSISTED preferences.
+
+    Web search is gated by `CustomUser.spotlight_web_search_enabled` (toggled
+    in Settings → Spotlight), NOT by a frontend-sent `allow_web_search` flag.
+    The flag was fragile: a stale client bundle, or a failed/racing preference
+    fetch, could send `false` even with the toggle on — silently dropping
+    `search_web` so the agent answered "I don't have a web search tool" while
+    the user's saved preference was ON. Reading the stored field here makes
+    the toggle authoritative regardless of client state. The preference is the
+    same value the client writes via PATCH /user/preferences/spotlight-web-search/,
+    so there's a single source of truth.
+    """
+    disabled: set[str] = set()
+    if not bool(getattr(user, "spotlight_web_search_enabled", False)):
+        disabled.add("search_web")
+    return disabled
+
 
 # Phase 3.5 — upper bound on how many prior turns we'll load when
 # `RAG_SESSION_ROLLING_SUMMARY` is on. The session TTL (default 30 min)
@@ -211,15 +239,21 @@ def _load_prior_turns(session: AgentSession, max_turns: int) -> list[tuple[str, 
 
     Only includes runs that have a non-empty `final_answer_text` (i.e.
     the model produced an actual answer — done, rejected, etc.). Each
-    answer is truncated to `_PRIOR_ANSWER_MAX_CHARS` to keep the
-    context budget predictable.
+    answer is truncated to `SESSION_PRIOR_ANSWER_MAX_CHARS` (default
+    `_DEFAULT_PRIOR_ANSWER_MAX_CHARS`) to keep the context budget
+    bounded while still carrying whole prior answers verbatim.
     """
+    max_chars = int(
+        settings.SEARCH_ENGINE.get(
+            "SESSION_PRIOR_ANSWER_MAX_CHARS", _DEFAULT_PRIOR_ANSWER_MAX_CHARS
+        )
+    )
     runs = (
         AgentRun.objects.filter(session=session)
         .exclude(final_answer_text="")
         .order_by("-started_at")[:max_turns]
     )
-    return [(r.query, r.final_answer_text[:_PRIOR_ANSWER_MAX_CHARS]) for r in reversed(list(runs))]
+    return [(r.query, r.final_answer_text[:max_chars]) for r in reversed(list(runs))]
 
 
 # --------------------------------------------------------------------------- #
@@ -387,12 +421,11 @@ class AgentAskView(AuthenticatedAPIView):
         except Exception:  # noqa: BLE001
             log.exception("Failed to create AgentRun row; continuing without persistence")
 
-        # Per-request tool gates from the frontend Spotlight preferences.
-        # `allow_web_search` defaults to True so older clients that omit
-        # the field get the same behavior as before.
-        disabled_tools: set[str] = set()
-        if data.get("allow_web_search") is False:
-            disabled_tools.add("search_web")
+        # Per-request tool gates. Web search is gated by the user's
+        # PERSISTED preference (see `_persisted_disabled_tools`), which is
+        # authoritative — the old frontend-sent `allow_web_search` flag was
+        # fragile and is now ignored.
+        disabled_tools: set[str] = _persisted_disabled_tools(request.user)
 
         # Thread Q&A branch: when the frontend passes a `thread_context`,
         # the agent is *primed* with that thread's summary but still has
