@@ -5,9 +5,11 @@
 > to answer with citations, and takes approval-gated actions — running on **Vertex AI +
 > Cloud Run**, shipped through a **CI/CD pipeline that gates every deploy on agent evals**.
 
-**Live:** https://gcp.genosai.dev · **Demo login available** (a pre-seeded workspace — open `Cmd-K` and ask *"How is the Website Redesign project going?"*)
+**💡 Live 👉** https://gcp.genosai.dev
 
-📐 **システム構成の詳細は [ARCHITECTURE.md](ARCHITECTURE.md)**（インフラ / API / フロントエンド + 図）。
+**👀 Try it yourself with demo user 👉** https://gcp.genosai.dev/demo-guide
+
+📐 **Architecture details 👉** [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
 
